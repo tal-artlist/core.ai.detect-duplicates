@@ -52,3 +52,4 @@ test_downloads*/
 *_results*.json
 debug_*.py
 test_*.py
+.ipynb_checkpoints
