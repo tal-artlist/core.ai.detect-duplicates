@@ -210,3 +210,4 @@ def create_download_summary(results: Dict[str, Any]) -> Dict[str, Any]:
         'artlist_downloads': artlist_downloads,
         'motionarray_downloads': motionarray_downloads
     }
+

@@ -18,13 +18,93 @@ except ImportError:
     logger.warning("Snowflake/GCP dependencies not available. Install with: pip install snowflake-connector-python google-cloud-secret-manager")
 
 
-class SnowflakeManager:
-    """Manages Snowflake connections and queries."""
+class SnowflakeConnector:
+    """Manages Snowflake connections and queries for audio fingerprint processing."""
+    
+    def __init__(self, config: Dict = None):
+        """Initialize the Snowflake connector."""
+        if not SNOWFLAKE_AVAILABLE:
+            raise ImportError("Snowflake/GCP dependencies not available")
+        self.config = config or {}
+        self._connection = None
+    
+    def get_snowflake_secret(self, secret_id: str = "ai_team_snowflake_credentials", 
+                           project_id: str = "889375371783") -> Optional[Dict[str, Any]]:
+        """Get Snowflake credentials from Google Cloud Secret Manager."""
+        try:
+            client = secretmanager.SecretManagerServiceClient()
+            name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+            response = client.access_secret_version(request={"name": name})
+            return json.loads(response.payload.data.decode("UTF-8"))
+        except Exception as e:
+            logger.warning(f"Failed to get credentials from Google Cloud: {e}")
+            return None
+    
+    def get_legacy_secret(self, secret_name: str = "snowflake-ai_team-artlist", 
+                         env: str = "prd") -> Optional[Dict[str, Any]]:
+        """Fallback method for legacy secret retrieval."""
+        try:
+            logger.warning("Legacy secret retrieval not implemented")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to get legacy credentials: {e}")
+            return None
+    
+    def _get_connection(self):
+        """Get or create Snowflake connection"""
+        if self._connection is None:
+            # Try provided config first
+            if self.config:
+                creds = self.config
+            else:
+                # Try Google Cloud
+                creds = self.get_snowflake_secret()
+                
+                # Fallback to legacy method
+                if creds is None:
+                    creds = self.get_legacy_secret()
+                
+                if creds is None:
+                    raise Exception("Could not obtain Snowflake credentials from any source")
+            
+            # Add defaults for BI PROD AI DATA
+            if "database" not in creds:
+                creds["database"] = "BI_PROD"
+            if "schema" not in creds:
+                creds["schema"] = "AI_DATA"
+            
+            # Connect
+            self._connection = snowflake.connector.connect(**creds)
+        
+        return self._connection
+    
+    def execute_query(self, query: str, params: Dict = None):
+        """Execute query with optional parameters"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            return cursor
+        except Exception as e:
+            cursor.close()
+            raise e
+    
+    def close(self):
+        """Close connection"""
+        if self._connection:
+            self._connection.close()
+            self._connection = None
+
+class SnowflakeManager(SnowflakeConnector):
+    """Legacy alias for backward compatibility"""
     
     def __init__(self):
         """Initialize the Snowflake manager."""
-        if not SNOWFLAKE_AVAILABLE:
-            raise ImportError("Snowflake/GCP dependencies not available")
+        super().__init__()
     
     def get_snowflake_secret(self, secret_id: str = "ai_team_snowflake_credentials", 
                            project_id: str = "889375371783") -> Optional[Dict[str, Any]]:

@@ -6,11 +6,18 @@ This script provides functions to:
 1. Obtain keys from Snowflake queries
 2. Bulk download artifacts using the platform APIs
 3. Handle download responses and file management
+
+Usage:
+    python bulk_sample_downloader.py --output-dir ./samples
+    python bulk_sample_downloader.py --artlist-only
+    python bulk_sample_downloader.py --motionarray-only
+    python bulk_sample_downloader.py --limit 50
 """
 
 import json
 import logging
-import sqlite3
+import argparse
+import sys
 from pathlib import Path
 from typing import List, Dict, Any
 import requests
@@ -31,7 +38,6 @@ from snowflake_utils import (
 # Setup logging
 setup_logging()
 logger = logging.getLogger(__name__)
-
 
 class BulkDownloader:
     """Main class for handling bulk downloads from Artlist and MotionArray APIs."""
@@ -56,39 +62,8 @@ class BulkDownloader:
         self.motionarray_dir = self.download_dir / "motionarray"
         
         create_directories(self.download_dir, self.artlist_dir, self.motionarray_dir)
-    
-    def get_keys_from_sql(self, db_path: str, query: str) -> List[str]:
-        """
-        Execute SQL query to obtain download keys from SQLite database.
         
-        Args:
-            db_path: Path to the SQLite database file
-            query: SQL query to execute (should return keys in first column)
-            
-        Returns:
-            List of keys obtained from the query
-            
-        Raises:
-            sqlite3.Error: If database operation fails
-        """
-        try:
-            with sqlite3.connect(db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(query)
-                results = cursor.fetchall()
-                
-                # Extract keys from first column of results
-                keys = [str(row[0]) for row in results if row[0] is not None]
-                
-                logger.info(f"Retrieved {len(keys)} keys from SQL query")
-                return keys
-                
-        except sqlite3.Error as e:
-            logger.error(f"Database error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error executing SQL query: {e}")
-            raise
+        logger.info(f"✅ Bulk downloader initialized, output directory: {self.download_dir}")
     
     def bulk_download_request(self, keys: List[str], platform: str = "artlist") -> Dict[str, Any]:
         """
@@ -156,6 +131,12 @@ class BulkDownloader:
                 # Get filename from URL or use key as fallback
                 filename = extract_filename_from_url(url, key)
                 file_path = target_dir / filename
+                
+                # Skip if file already exists
+                if file_path.exists():
+                    logger.info(f"⏭️  File already exists: {filename}")
+                    results[key] = True
+                    continue
                 
                 # Download file
                 success = download_file(url, file_path)
@@ -378,59 +359,108 @@ class BulkDownloader:
         
         return results
 
-
 def main():
     """Main function to run the bulk downloader."""
-    downloader = BulkDownloader()
+    parser = argparse.ArgumentParser(description='Bulk Sample Downloader for Audio Catalogs')
+    parser.add_argument('--output-dir', default='./samples',
+                       help='Output directory for downloaded files (default: ./samples)')
+    parser.add_argument('--limit', type=int, default=100,
+                       help='Number of files to download per catalog (default: 100)')
+    parser.add_argument('--artlist-only', action='store_true',
+                       help='Download only from Artlist catalog')
+    parser.add_argument('--motionarray-only', action='store_true',
+                       help='Download only from MotionArray catalog')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.artlist_only and args.motionarray_only:
+        logger.error("❌ Cannot specify both --artlist-only and --motionarray-only")
+        sys.exit(1)
+    
+    downloader = BulkDownloader(args.output_dir)
     
     print("=== BULK DOWNLOADER - DUAL PLATFORM ===")
-    print("This script will download 100 songs from both Artlist and MotionArray")
+    print(f"This script will download {args.limit} songs from each platform")
     print("=" * 50)
     
     try:
-        # Download from both platforms
-        results = downloader.download_both_platforms(
-            artlist_limit=100,
-            motionarray_limit=100
-        )
-        
-        # Print detailed results
-        print("\n=== DOWNLOAD RESULTS ===")
-        print(json.dumps(results['summary'], indent=2))
-        
-        # Print platform-specific details
-        if results['artlist']:
-            print(f"\n--- ARTLIST DETAILS ---")
-            if results['artlist']['success']:
-                print(f"✓ Success: {results['artlist']['downloads_successful']} files downloaded")
-                print(f"  Assets from Snowflake: {results['artlist'].get('snowflake_assets', 'N/A')}")
-                print(f"  Keys extracted: {results['artlist'].get('extracted_keys', 'N/A')}")
+        if args.artlist_only:
+            results = downloader.download_artlist_songs(args.limit)
+            
+            # Print results
+            print(f"\n--- ARTLIST RESULTS ---")
+            if results['success']:
+                print(f"✓ Success: {results['downloads_successful']} files downloaded")
+                print(f"  Assets from Snowflake: {results.get('snowflake_assets', 'N/A')}")
+                print(f"  Keys extracted: {results.get('extracted_keys', 'N/A')}")
             else:
-                print(f"✗ Failed: {results['artlist'].get('error', 'Unknown error')}")
-        
-        if results['motionarray']:
-            print(f"\n--- MOTIONARRAY DETAILS ---")
-            if results['motionarray']['success']:
-                print(f"✓ Success: {results['motionarray']['downloads_successful']} files downloaded")
-                print(f"  Assets from Snowflake: {results['motionarray'].get('snowflake_assets', 'N/A')}")
-                print(f"  Keys extracted: {results['motionarray'].get('extracted_keys', 'N/A')}")
+                print(f"✗ Failed: {results.get('error', 'Unknown error')}")
+                
+        elif args.motionarray_only:
+            results = downloader.download_motionarray_songs(args.limit)
+            
+            # Print results
+            print(f"\n--- MOTIONARRAY RESULTS ---")
+            if results['success']:
+                print(f"✓ Success: {results['downloads_successful']} files downloaded")
+                print(f"  Assets from Snowflake: {results.get('snowflake_assets', 'N/A')}")
+                print(f"  Keys extracted: {results.get('extracted_keys', 'N/A')}")
             else:
-                print(f"✗ Failed: {results['motionarray'].get('error', 'Unknown error')}")
-        
-        # Overall summary
-        print(f"\n=== SUMMARY ===")
-        print(f"Total files downloaded: {results['summary']['total_downloads']}")
-        print(f"Overall success: {'✓' if results['summary']['overall_success'] else '✗'}")
+                print(f"✗ Failed: {results.get('error', 'Unknown error')}")
+        else:
+            # Download from both platforms
+            results = downloader.download_both_platforms(
+                artlist_limit=args.limit,
+                motionarray_limit=args.limit
+            )
+            
+            # Print detailed results
+            print("\n=== DOWNLOAD RESULTS ===")
+            print(json.dumps(results['summary'], indent=2))
+            
+            # Print platform-specific details
+            if results['artlist']:
+                print(f"\n--- ARTLIST DETAILS ---")
+                if results['artlist']['success']:
+                    print(f"✓ Success: {results['artlist']['downloads_successful']} files downloaded")
+                    print(f"  Assets from Snowflake: {results['artlist'].get('snowflake_assets', 'N/A')}")
+                    print(f"  Keys extracted: {results['artlist'].get('extracted_keys', 'N/A')}")
+                else:
+                    print(f"✗ Failed: {results['artlist'].get('error', 'Unknown error')}")
+            
+            if results['motionarray']:
+                print(f"\n--- MOTIONARRAY DETAILS ---")
+                if results['motionarray']['success']:
+                    print(f"✓ Success: {results['motionarray']['downloads_successful']} files downloaded")
+                    print(f"  Assets from Snowflake: {results['motionarray'].get('snowflake_assets', 'N/A')}")
+                    print(f"  Keys extracted: {results['motionarray'].get('extracted_keys', 'N/A')}")
+                else:
+                    print(f"✗ Failed: {results['motionarray'].get('error', 'Unknown error')}")
+            
+            # Overall summary
+            print(f"\n=== SUMMARY ===")
+            print(f"Total files downloaded: {results['summary']['total_downloads']}")
+            print(f"Overall success: {'✓' if results['summary']['overall_success'] else '✗'}")
         
         # File locations
         print(f"\n=== FILE LOCATIONS ===")
         print(f"Artlist files: {downloader.artlist_dir}")
         print(f"MotionArray files: {downloader.motionarray_dir}")
         
+        # Save results to JSON file
+        results_file = Path(args.output_dir) / 'download_results.json'
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        
+        logger.info(f"📄 Results saved to: {results_file}")
+        
+    except KeyboardInterrupt:
+        logger.info("⏹️  Download interrupted by user")
     except Exception as e:
         print(f"✗ Critical error: {e}")
         logger.error(f"Main execution failed: {e}")
-
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

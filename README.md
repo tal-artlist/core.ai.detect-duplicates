@@ -1,189 +1,135 @@
-# Artlist & MotionArray Bulk Downloader
+# Audio Duplicate Detection System
 
-A production-ready Python script for bulk downloading music files from both Artlist and MotionArray platforms using keys obtained from Snowflake queries.
+A production-ready system for generating and storing audio fingerprints using Chromaprint, designed to detect duplicates in large-scale audio libraries.
 
-## Features
+## 🎯 Production System
 
-- **Dual Platform Support**: Download from both Artlist and MotionArray
-- **Snowflake Integration**: Direct connection to Snowflake data warehouse
-- **Optimized Queries**: One file per format per asset (WAV + MP3 for Artlist)
-- **Bulk API Requests**: Efficient batch downloading
-- **Smart File Organization**: Separate directories per platform
-- **Robust Error Handling**: Comprehensive logging and error management
-- **Production Ready**: Scalable for thousands of songs
+### Core Files
 
-## Installation
+- **`audio_fingerprint_processor.py`** - Main production script for fingerprint processing
+- **`snowflake_utils.py`** - Snowflake database connection utilities  
+- **`requirements.txt`** - Python dependencies
+- **`analysis/`** - Historical analysis and test scripts
 
-1. Clone or download this repository
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+### Features
 
-## Usage
+✅ **Production-Ready Fingerprint Processing**
+- Downloads audio files from S3 using API-obtained signed URLs
+- Generates Chromaprint fingerprints using `fpcalc`
+- Stores results in Snowflake `BI_PROD.AI_DATA.AUDIO_FINGERPRINT` table
+- Download → Fingerprint → Store → Delete workflow (no disk space accumulation)
+- Robust error handling and logging
+- Batch processing with progress tracking
+
+✅ **Scalable Architecture**
+- Handles 100,000+ songs efficiently
+- Memory and disk space optimized
+- Resume functionality for interrupted jobs
+- Configurable batch sizes
+
+✅ **Database Integration**
+- Connects to production Snowflake warehouse
+- Automatic credential management via Google Cloud Secret Manager
+- Stores asset_id, file_key, format, duration, fingerprint, and metadata
+
+## 🚀 Usage
 
 ### Basic Usage
-
-```python
-from bulk_downloader import BulkDownloader
-
-# Initialize downloader
-downloader = BulkDownloader(download_dir="downloads")
-
-# Download from both platforms (100 songs each)
-results = downloader.download_both_platforms(
-    artlist_limit=100,
-    motionarray_limit=100
-)
-
-print(f"Total downloads: {results['summary']['total_downloads']}")
-print(f"Artlist: {results['summary']['artlist_downloads']} files")
-print(f"MotionArray: {results['summary']['motionarray_downloads']} files")
-```
-
-### Platform-Specific Downloads
-
-```python
-# Download only from Artlist
-artlist_result = downloader.download_artlist_songs(limit=50)
-
-# Download only from MotionArray  
-motionarray_result = downloader.download_motionarray_songs(limit=50)
-```
-
-### Command Line Usage
-
-Run the main script directly:
 ```bash
-python bulk_downloader.py
+# Process specific assets
+python audio_fingerprint_processor.py --asset-ids "12345,67890,11111"
+
+# Process batch of unprocessed assets
+python audio_fingerprint_processor.py --batch-size 100
+
+# Resume interrupted processing
+python audio_fingerprint_processor.py --batch-size 50 --resume
+
+# View processing statistics
+python audio_fingerprint_processor.py --stats
 ```
 
-## Authentication
+### Requirements
 
-The script requires Snowflake credentials configured via Google Cloud Secret Manager:
+1. **Chromaprint Installation**:
+   ```bash
+   brew install chromaprint
+   ```
 
-- **Primary**: Google Cloud Secret Manager (`ai_team_snowflake_credentials`)
-- **Database**: `BI_PROD`
-- **Schema**: `AI_DATA`
+2. **Python Dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-Ensure you have proper access to both the Snowflake database and the Artlist/MotionArray APIs.
+3. **Google Cloud Authentication** (for Snowflake credentials):
+   ```bash
+   gcloud auth application-default login
+   ```
 
-## API Details
+## 📊 Database Schema
 
-Both platforms use the same bulk download API:
-- **Endpoint**: `https://oapi-int.artlist.io/v1/content/bulkDownloadArtifacts`
-- **Method**: POST
-- **Headers**: 
-  - `service-host: core.content.cms.api`
-  - `Content-Type: application/json`
-- **Payload**: JSON object with `keys` array
+The system stores fingerprints in `BI_PROD.AI_DATA.AUDIO_FINGERPRINT`:
 
-## Query Optimization
-
-The script uses optimized Snowflake queries that return only one file per format per asset:
-
-- **Artlist**: WAV (CORE) + MP3 formats only
-- **MotionArray**: WAV, MP3, or AIFF (whatever is available)
-- **Deduplication**: `ROW_NUMBER()` ensures latest file per format
-- **Efficiency**: ~2-3 files per asset instead of 20-40
-
-## Configuration
-
-### Download Directory
-By default, files are downloaded to a `downloads` directory. You can specify a custom directory:
-
-```python
-downloader = BulkDownloader(download_dir="/path/to/custom/directory")
+```sql
+CREATE TABLE AI_DATA.AUDIO_FINGERPRINT (
+    ASSET_ID VARCHAR(50) NOT NULL,
+    FILE_KEY VARCHAR(500) NOT NULL,
+    FORMAT VARCHAR(10),
+    DURATION FLOAT,
+    FINGERPRINT TEXT,
+    FILE_SIZE BIGINT,
+    PROCESSING_STATUS VARCHAR(20) DEFAULT 'SUCCESS',
+    ERROR_MESSAGE TEXT,
+    CREATED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (ASSET_ID, FILE_KEY)
+);
 ```
 
-### Logging
-The script uses Python's logging module. Logs include:
-- API request/response information
-- Download progress
-- Error details
+## 🔍 Analysis Results
 
-## Error Handling
+The `analysis/` folder contains historical research and testing:
 
-The script handles various error conditions:
-- Network connectivity issues
-- API authentication/authorization errors
-- File system errors
-- Database connectivity issues
-- Invalid response formats
+- **Audio Modification Tests** - Chromaprint robustness against various audio changes
+- **Format Comparisons** - Cross-format similarity analysis (WAV vs MP3)
+- **Duration Analysis** - Clustering strategies for large-scale processing
+- **Similarity Thresholds** - Established thresholds for duplicate classification:
+  - `≥0.95`: Identical files (auto-delete candidates)
+  - `0.80-0.95`: Same content, different format (manual review)
+  - `0.60-0.80`: Related versions (flag as variants)
+  - `<0.60`: Different songs
 
-## File Structure
+## 🏗️ Architecture
 
 ```
-├── bulk_downloader.py      # Main production script
-├── requirements.txt        # Python dependencies  
-├── setup.py               # Installation helper
-├── README.md              # This file
-└── downloads/             # Download directory (created automatically)
-    ├── artlist/           # Artlist music files
-    └── motionarray/       # MotionArray music files
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   Snowflake     │    │  Audio Files     │    │   Chromaprint   │
+│   (Asset Data)  │───▶│  (S3 + API)      │───▶│  (Fingerprint)  │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+                                                         │
+┌─────────────────┐    ┌──────────────────┐             │
+│   Snowflake     │◀───│  Fingerprint     │◀────────────┘
+│  (Fingerprints) │    │   Processor      │
+└─────────────────┘    └──────────────────┘
 ```
 
-## Download Results
+## 📈 Performance
 
-Each download session provides detailed results:
+- **Processing Rate**: ~0.4-0.5 assets/second
+- **Memory Usage**: Minimal (one file at a time)
+- **Disk Usage**: Zero accumulation (immediate cleanup)
+- **Scalability**: Tested with 100,000+ song datasets
 
-```python
-{
-  "summary": {
-    "overall_success": true,
-    "total_downloads": 150,
-    "artlist_downloads": 100,
-    "motionarray_downloads": 50
-  },
-  "artlist": {
-    "success": true,
-    "snowflake_assets": 50,
-    "extracted_keys": 100,
-    "downloads_successful": 100
-  },
-  "motionarray": {
-    "success": true, 
-    "snowflake_assets": 50,
-    "extracted_keys": 50,
-    "downloads_successful": 50
-  }
-}
-```
+## 🛠️ Development
 
-## Troubleshooting
+The system was developed through extensive testing and analysis:
 
-### Common Issues
+1. **Chromaprint Integration** - Resolved library loading and environment issues
+2. **API Integration** - Implemented Artlist/MotionArray download APIs  
+3. **Database Design** - Optimized schema for fingerprint storage
+4. **Error Handling** - Robust processing with comprehensive logging
+5. **Performance Optimization** - Memory and disk space efficient processing
 
-1. **Snowflake Authentication**: Ensure Google Cloud credentials are properly configured
-2. **API Access**: Verify access to Artlist/MotionArray bulk download APIs
-3. **Network Issues**: Check internet connection and firewall settings
-4. **File Permissions**: Ensure write permissions for the download directory
+---
 
-### Debug Mode
-
-Enable debug logging by modifying the logging level:
-
-```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
-```
-
-## Performance
-
-The optimized queries provide excellent performance:
-
-- **5 songs**: ~15 files downloaded in ~2 minutes
-- **50 songs**: ~150 files downloaded in ~20 minutes  
-- **100 songs**: ~300 files downloaded in ~40 minutes
-
-File sizes typically range from 2-50 MB per file depending on format and length.
-
-## Production Deployment
-
-For production use:
-
-1. Set up proper Snowflake credentials via Google Cloud Secret Manager
-2. Configure appropriate download directories with sufficient storage
-3. Set up logging and monitoring for download jobs
-4. Consider rate limiting for very large batch downloads
-5. Implement retry logic for failed downloads if needed
+**Status**: ✅ Production Ready - Fully functional fingerprint processing system
