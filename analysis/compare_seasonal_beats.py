@@ -220,7 +220,9 @@ def main():
     
     # Save results
     df_comparisons = pd.DataFrame(comparisons)
-    output_file = "seasonal_beats_comparison.csv"
+    results_dir = Path(__file__).parent / "results"
+    results_dir.mkdir(exist_ok=True)
+    output_file = results_dir / "seasonal_beats_comparison.csv"
     df_comparisons.to_csv(output_file, index=False)
     print(f"\n📁 Detailed results saved to: {output_file}")
     

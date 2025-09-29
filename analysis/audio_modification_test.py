@@ -358,7 +358,9 @@ def main():
                     print(f"   • {low} modifications show low similarity (<0.50)")
             
             # Save detailed results
-            output_file = f"audio_modification_test_results.csv"
+            results_dir = Path(__file__).parent / "results"
+            results_dir.mkdir(exist_ok=True)
+            output_file = results_dir / "audio_modification_test_results.csv"
             df.to_csv(output_file, index=False)
             print(f"\n📁 Detailed results saved to: {output_file}")
             
