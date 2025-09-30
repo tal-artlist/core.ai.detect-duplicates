@@ -27,7 +27,7 @@ if 'DYLD_LIBRARY_PATH' not in os.environ or '/opt/homebrew/lib' not in os.enviro
     result = subprocess.run([sys.executable] + sys.argv, env=env)
     sys.exit(result.returncode)
 
-from enhanced_fingerprint_processor import EnhancedAudioFingerprintProcessor
+from audio_fingerprint_processor import EnhancedAudioFingerprintProcessor
 
 # Configure logging
 logging.basicConfig(
