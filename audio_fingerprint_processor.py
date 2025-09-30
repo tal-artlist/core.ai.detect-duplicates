@@ -497,6 +497,31 @@ class AudioFingerprintProcessor:
                    f"({total_time/60:.1f}min, {results['rate_per_second']:.1f} assets/sec)")
         
         return results
+    
+    def get_processing_stats(self) -> Dict:
+        """Get processing statistics from Snowflake"""
+        stats_sql = """
+        SELECT 
+            COUNT(*) as total_records,
+            COUNT(CASE WHEN processing_status = 'SUCCESS' THEN 1 END) as successful,
+            COUNT(CASE WHEN processing_status = 'ERROR' THEN 1 END) as failed,
+            AVG(CASE WHEN processing_status = 'SUCCESS' THEN duration END) as avg_duration,
+            MIN(created_at) as first_processed,
+            MAX(created_at) as last_processed
+        FROM AI_DATA.AUDIO_FINGERPRINT
+        """
+        
+        try:
+            cursor = self.snowflake.execute_query(stats_sql)
+            row = cursor.fetchone()
+            if row:
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, row))
+            else:
+                return {}
+        except Exception as e:
+            logger.error(f"❌ Failed to get stats: {e}")
+            return {}
 
 def main():
     parser = argparse.ArgumentParser(description='Audio Fingerprint Processor with Parallel Processing')
@@ -523,10 +548,7 @@ def main():
     
     # Show stats if requested
     if args.stats:
-        # Use original processor for stats (compatibility)
-        from audio_fingerprint_processor import AudioFingerprintProcessor
-        original_processor = AudioFingerprintProcessor()
-        stats = original_processor.get_processing_stats()
+        stats = processor.get_processing_stats()
         print("\n📊 Processing Statistics:")
         for key, value in stats.items():
             print(f"   {key}: {value}")
