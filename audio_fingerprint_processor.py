@@ -1,24 +1,5 @@
 #!/usr/bin/env python3
-"""
-Enhanced Audio Fingerprint Processor with Parallel Processing
 
-This enhanced version adds:
-- Parallel processing using ThreadPoolExecutor
-- Source-specific processing (Artlist-only, MotionArray-only)
-- Process ALL songs from a source (not just batches)
-- Better progress tracking and performance monitoring
-- Configurable worker threads
-
-Usage:
-    # Process ALL Artlist songs with parallel processing
-    python enhanced_fingerprint_processor.py --source artlist --workers 8
-    
-    # Process ALL MotionArray songs with parallel processing  
-    python enhanced_fingerprint_processor.py --source motionarray --workers 4
-    
-    # Process specific asset IDs with parallel processing
-    python enhanced_fingerprint_processor.py --asset-ids "12345,67890" --workers 6
-"""
 
 import os
 import sys
@@ -55,8 +36,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class EnhancedAudioFingerprintProcessor:
-    """Enhanced processor with parallel processing and source filtering"""
+class AudioFingerprintProcessor:
+    """Processor with parallel processing and source filtering"""
     
     def __init__(self, max_workers: int = 4):
         self.snowflake = SnowflakeConnector()
@@ -518,7 +499,7 @@ class EnhancedAudioFingerprintProcessor:
         return results
 
 def main():
-    parser = argparse.ArgumentParser(description='Enhanced Audio Fingerprint Processor with Parallel Processing')
+    parser = argparse.ArgumentParser(description='Audio Fingerprint Processor with Parallel Processing')
     parser.add_argument('--source', choices=['artlist', 'motionarray'], 
                        help='Process ALL songs from specific source')
     parser.add_argument('--asset-ids', help='Comma-separated list of asset IDs to process')
@@ -534,7 +515,7 @@ def main():
     
     # Initialize processor
     try:
-        processor = EnhancedAudioFingerprintProcessor(max_workers=args.workers)
+        processor = AudioFingerprintProcessor(max_workers=args.workers)
         processor.ensure_table_exists()
     except Exception as e:
         logger.error(f"❌ Failed to initialize processor: {e}")

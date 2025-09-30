@@ -27,7 +27,7 @@ if 'DYLD_LIBRARY_PATH' not in os.environ or '/opt/homebrew/lib' not in os.enviro
     result = subprocess.run([sys.executable] + sys.argv, env=env)
     sys.exit(result.returncode)
 
-from audio_fingerprint_processor import EnhancedAudioFingerprintProcessor
+from audio_fingerprint_processor import AudioFingerprintProcessor
 
 # Configure logging
 logging.basicConfig(
@@ -67,7 +67,7 @@ class WorkerBenchmark:
     
     def get_sample_assets(self, source: str, sample_size: int) -> List[Dict]:
         """Get a small sample of assets for benchmarking"""
-        processor = EnhancedAudioFingerprintProcessor(max_workers=1)
+        processor = AudioFingerprintProcessor(max_workers=1)
         
         try:
             # Get all assets but limit to sample size
@@ -144,7 +144,7 @@ class WorkerBenchmark:
         print(f"🧪 Testing {worker_count} workers...")
         
         # Create processor with specific worker count
-        processor = EnhancedAudioFingerprintProcessor(max_workers=worker_count)
+        processor = AudioFingerprintProcessor(max_workers=worker_count)
         
         # Record system state before
         cpu_before = psutil.cpu_percent()
@@ -194,15 +194,15 @@ class WorkerBenchmark:
         
         # Determine worker counts to test based on system
         cpu_count = self.system_info['cpu_count']
-        worker_counts = [1, 2, 4]
+        worker_counts = [1, 2, 4, 6, 8]
         
-        # Add more worker counts based on CPU cores
-        if cpu_count >= 6:
-            worker_counts.extend([6, 8])
+        # Add more worker counts based on CPU cores (your system has 14 cores)
         if cpu_count >= 10:
-            worker_counts.extend([10, 12])
+            worker_counts.extend([10, 12, 14])
+        if cpu_count >= 14:
+            worker_counts.extend([16, 18, 20])
         if cpu_count >= 16:
-            worker_counts.extend([16, 20])
+            worker_counts.extend([24, 28])
         
         # Don't exceed 2x CPU count (diminishing returns)
         worker_counts = [w for w in worker_counts if w <= cpu_count * 2]
@@ -310,14 +310,14 @@ class WorkerBenchmark:
         
         print(f"\n🚀 COMMAND TO USE:")
         recommended_workers = best_efficiency['workers']
-        print(f"   python enhanced_fingerprint_processor.py --source artlist --workers {recommended_workers}")
+        print(f"   python audio_fingerprint_processor.py --source artlist --workers {recommended_workers}")
 
 def main():
     parser = argparse.ArgumentParser(description='Benchmark optimal worker count for your system')
     parser.add_argument('--source', choices=['artlist', 'motionarray'], required=True,
                        help='Source to benchmark (artlist or motionarray)')
-    parser.add_argument('--sample-size', type=int, default=20,
-                       help='Number of assets to test with (default: 20)')
+    parser.add_argument('--sample-size', type=int, default=30,
+                       help='Number of assets to test with (default: 30)')
     
     args = parser.parse_args()
     
