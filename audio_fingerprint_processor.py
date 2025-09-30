@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Audio Fingerprint Processor for Production
+Enhanced Audio Fingerprint Processor with Parallel Processing
 
-This script processes audio files, generates fingerprints, and stores them in Snowflake.
-Designed for production use with the BI PROD AI DATA warehouse.
-
-Features:
-- Downloads audio files from S3/URLs using file keys
-- Generates Chromaprint fingerprints
-- Stores results in Snowflake AUDIO_FINGERPRINT table
-- Handles batch processing and error recovery
-- Supports resume functionality for interrupted jobs
+This enhanced version adds:
+- Parallel processing using ThreadPoolExecutor
+- Source-specific processing (Artlist-only, MotionArray-only)
+- Process ALL songs from a source (not just batches)
+- Better progress tracking and performance monitoring
+- Configurable worker threads
 
 Usage:
-    python audio_fingerprint_processor.py --asset-ids 12345,67890
-    python audio_fingerprint_processor.py --batch-size 100 --resume
+    # Process ALL Artlist songs with parallel processing
+    python enhanced_fingerprint_processor.py --source artlist --workers 8
+    
+    # Process ALL MotionArray songs with parallel processing  
+    python enhanced_fingerprint_processor.py --source motionarray --workers 4
+    
+    # Process specific asset IDs with parallel processing
+    python enhanced_fingerprint_processor.py --asset-ids "12345,67890" --workers 6
 """
 
 import os
@@ -27,6 +30,9 @@ from pathlib import Path
 import time
 from typing import List, Dict, Optional, Tuple
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import threading
 
 # Auto-restart with correct environment if needed
 if 'DYLD_LIBRARY_PATH' not in os.environ or '/opt/homebrew/lib' not in os.environ.get('DYLD_LIBRARY_PATH', ''):
@@ -42,21 +48,28 @@ from snowflake_utils import SnowflakeConnector
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
     handlers=[
-        logging.FileHandler('audio_fingerprint_processor.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-class AudioFingerprintProcessor:
-    """Processes audio files and stores fingerprints in Snowflake"""
+class EnhancedAudioFingerprintProcessor:
+    """Enhanced processor with parallel processing and source filtering"""
     
-    def __init__(self):
-        self.snowflake = SnowflakeConnector()  # Uses existing credential management
+    def __init__(self, max_workers: int = 4):
+        self.snowflake = SnowflakeConnector()
         self.acoustid = self.setup_chromaprint()
-        self.temp_dir = None
+        self.max_workers = max_workers
+        self.temp_dirs = {}  # Thread-safe temp directory management
+        self.stats_lock = Lock()
+        self.stats = {
+            'processed': 0,
+            'successful': 0,
+            'failed': 0,
+            'start_time': None
+        }
         
     def setup_chromaprint(self):
         """Set up Chromaprint library and environment"""
@@ -100,119 +113,136 @@ class AudioFingerprintProcessor:
             logger.error(f"❌ Failed to create table: {e}")
             raise
     
-    def get_asset_file_keys(self, asset_ids: List[str] = None, batch_size: int = 100) -> List[Dict]:
+    def get_all_assets_by_source(self, source: str) -> List[Dict]:
         """
-        Get asset file keys from Artlist and MotionArray tables
+        Get ALL assets from a specific source (artlist or motionarray)
         """
-        if asset_ids:
-            # Get specific assets - combine both Artlist and MotionArray
-            asset_filter = "', '".join(asset_ids)
-            
-            artlist_query = f"""
-            WITH base AS (
-              SELECT
-                da.asset_id::string as asset_id,
-                sf.filekey AS file_key,
-                CASE WHEN sf.role = 'CORE' THEN 'wav' ELSE LOWER(sf.role) END AS file_format,
-                0 as file_size,
-                'artlist' as source
-              FROM BI_PROD.dwh.DIM_ASSETS da
-              JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_ASSET a
-                ON da.asset_id::string = a.externalid::int::string
-              JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_songFILE sf
-                ON a.id = sf.songid
-              WHERE da.product_indicator = 1
-                AND da.asset_type = 'Music'
-                AND sf.role IN ('CORE', 'MP3')
-                AND da.asset_id::string IN ('{asset_filter}')
-            )
-            SELECT * FROM base
-            
-            UNION ALL
-            
+        if source.lower() == 'artlist':
+            query = """
             SELECT
-              a.asset_id::string as asset_id,
-              b.guid AS file_key,
-              CASE
-                WHEN pf.format_id = 1 THEN 'wav'
-                WHEN pf.format_id = 2 THEN 'mp3'
-                WHEN pf.format_id = 3 THEN 'aiff'
-                ELSE 'mp3'
-              END AS file_format,
-              0 as file_size,
-              'motionarray' as source
-            FROM BI_PROD.dwh.DIM_ASSETS a
-            JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_RESOLUTIONS b
-              ON a.asset_id::string = b.product_id::string
-            JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_AUDIO_RESOLUTIONS c
-              ON b.id = c.parent_id
-            LEFT JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_FORMAT pf
-              ON pf.product_id = a.asset_id
-            WHERE a.product_indicator = 3
-              AND a.asset_sub_type ILIKE '%music%'
-              AND b.resolution_format = 1
-              AND a.asset_id::string IN ('{asset_filter}')
-            """
-        else:
-            # Get batch of unprocessed assets from both sources
-            artlist_query = f"""
-            WITH artlist_base AS (
-              SELECT
                 da.asset_id::string as asset_id,
                 sf.filekey AS file_key,
                 CASE WHEN sf.role = 'CORE' THEN 'wav' ELSE LOWER(sf.role) END AS file_format,
                 0 as file_size,
                 'artlist' as source
-              FROM BI_PROD.dwh.DIM_ASSETS da
-              JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_ASSET a
+            FROM BI_PROD.dwh.DIM_ASSETS da
+            JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_ASSET a
                 ON da.asset_id::string = a.externalid::int::string
-              JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_songFILE sf
+            JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_songFILE sf
                 ON a.id = sf.songid
-              LEFT JOIN AI_DATA.AUDIO_FINGERPRINT af 
+            LEFT JOIN AI_DATA.AUDIO_FINGERPRINT af 
                 ON da.asset_id::string = af.asset_id AND sf.filekey = af.file_key
-              WHERE da.product_indicator = 1
+            WHERE da.product_indicator = 1
                 AND da.asset_type = 'Music'
                 AND sf.role IN ('CORE', 'MP3')
-                AND af.asset_id IS NULL
-              LIMIT {min(50, batch_size // 2)}
-            ),
-            motionarray_base AS (
-              SELECT
+                AND af.asset_id IS NULL  -- Only unprocessed
+            ORDER BY da.asset_id
+            """
+        elif source.lower() == 'motionarray':
+            query = """
+            SELECT
                 a.asset_id::string as asset_id,
                 b.guid AS file_key,
                 CASE
-                  WHEN pf.format_id = 1 THEN 'wav'
-                  WHEN pf.format_id = 2 THEN 'mp3'
-                  WHEN pf.format_id = 3 THEN 'aiff'
-                  ELSE 'mp3'
+                    WHEN pf.format_id = 1 THEN 'wav'
+                    WHEN pf.format_id = 2 THEN 'mp3'
+                    WHEN pf.format_id = 3 THEN 'aiff'
+                    ELSE 'mp3'
                 END AS file_format,
                 0 as file_size,
                 'motionarray' as source
-              FROM BI_PROD.dwh.DIM_ASSETS a
-              JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_RESOLUTIONS b
+            FROM BI_PROD.dwh.DIM_ASSETS a
+            JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_RESOLUTIONS b
                 ON a.asset_id::string = b.product_id::string
-              JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_AUDIO_RESOLUTIONS c
+            JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_AUDIO_RESOLUTIONS c
                 ON b.id = c.parent_id
-              LEFT JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_FORMAT pf
+            LEFT JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_FORMAT pf
                 ON pf.product_id = a.asset_id
-              LEFT JOIN AI_DATA.AUDIO_FINGERPRINT af 
+            LEFT JOIN AI_DATA.AUDIO_FINGERPRINT af 
                 ON a.asset_id::string = af.asset_id AND b.guid = af.file_key
-              WHERE a.product_indicator = 3
+            WHERE a.product_indicator = 3
                 AND a.asset_sub_type ILIKE '%music%'
                 AND b.resolution_format = 1
-                AND af.asset_id IS NULL
-              LIMIT {min(50, batch_size // 2)}
-            )
-            SELECT * FROM artlist_base
-            UNION ALL
-            SELECT * FROM motionarray_base
+                AND af.asset_id IS NULL  -- Only unprocessed
+            ORDER BY a.asset_id
             """
+        else:
+            raise ValueError(f"Invalid source: {source}. Must be 'artlist' or 'motionarray'")
         
         try:
-            cursor = self.snowflake.execute_query(artlist_query)
+            cursor = self.snowflake.execute_query(query)
             results = cursor.fetchall()
             
-            # Convert to list of dictionaries
+            if results:
+                columns = [desc[0] for desc in cursor.description]
+                assets = [dict(zip(columns, row)) for row in results]
+                logger.info(f"📊 Found {len(assets)} unprocessed {source} assets")
+                return assets
+            else:
+                logger.warning(f"⚠️  No unprocessed {source} assets found")
+                return []
+        except Exception as e:
+            logger.error(f"❌ Failed to get {source} assets: {e}")
+            return []
+    
+    def get_asset_file_keys(self, asset_ids: List[str] = None) -> List[Dict]:
+        """Get specific asset file keys (original method for compatibility)"""
+        if not asset_ids:
+            return []
+            
+        asset_filter = "', '".join(asset_ids)
+        
+        query = f"""
+        WITH artlist_base AS (
+          SELECT
+            da.asset_id::string as asset_id,
+            sf.filekey AS file_key,
+            CASE WHEN sf.role = 'CORE' THEN 'wav' ELSE LOWER(sf.role) END AS file_format,
+            0 as file_size,
+            'artlist' as source
+          FROM BI_PROD.dwh.DIM_ASSETS da
+          JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_ASSET a
+            ON da.asset_id::string = a.externalid::int::string
+          JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_songFILE sf
+            ON a.id = sf.songid
+          WHERE da.product_indicator = 1
+            AND da.asset_type = 'Music'
+            AND sf.role IN ('CORE', 'MP3')
+            AND da.asset_id::string IN ('{asset_filter}')
+        ),
+        motionarray_base AS (
+          SELECT
+            a.asset_id::string as asset_id,
+            b.guid AS file_key,
+            CASE
+              WHEN pf.format_id = 1 THEN 'wav'
+              WHEN pf.format_id = 2 THEN 'mp3'
+              WHEN pf.format_id = 3 THEN 'aiff'
+              ELSE 'mp3'
+            END AS file_format,
+            0 as file_size,
+            'motionarray' as source
+          FROM BI_PROD.dwh.DIM_ASSETS a
+          JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_RESOLUTIONS b
+            ON a.asset_id::string = b.product_id::string
+          JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_AUDIO_RESOLUTIONS c
+            ON b.id = c.parent_id
+          LEFT JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_FORMAT pf
+            ON pf.product_id = a.asset_id
+          WHERE a.product_indicator = 3
+            AND a.asset_sub_type ILIKE '%music%'
+            AND b.resolution_format = 1
+            AND a.asset_id::string IN ('{asset_filter}')
+        )
+        SELECT * FROM artlist_base
+        UNION ALL
+        SELECT * FROM motionarray_base
+        """
+        
+        try:
+            cursor = self.snowflake.execute_query(query)
+            results = cursor.fetchall()
+            
             if results:
                 columns = [desc[0] for desc in cursor.description]
                 return [dict(zip(columns, row)) for row in results]
@@ -222,12 +252,29 @@ class AudioFingerprintProcessor:
             logger.error(f"❌ Failed to get asset file keys: {e}")
             return []
     
+    def get_thread_temp_dir(self) -> Path:
+        """Get thread-specific temporary directory"""
+        thread_id = threading.current_thread().ident
+        if thread_id not in self.temp_dirs:
+            self.temp_dirs[thread_id] = tempfile.mkdtemp(prefix=f"audio_fp_thread_{thread_id}_")
+        return Path(self.temp_dirs[thread_id])
+    
+    def cleanup_thread_temp_dir(self):
+        """Clean up thread-specific temporary directory"""
+        thread_id = threading.current_thread().ident
+        if thread_id in self.temp_dirs:
+            import shutil
+            try:
+                shutil.rmtree(self.temp_dirs[thread_id])
+                del self.temp_dirs[thread_id]
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to cleanup temp dir for thread {thread_id}: {e}")
+    
     def get_download_url_from_api(self, file_key: str, source: str) -> Optional[str]:
         """Get signed download URL from Artlist/MotionArray API"""
         try:
             import requests
             
-            # Use the same API as bulk_downloader
             api_url = "https://oapi-int.artlist.io/v1/content/bulkDownloadArtifacts"
             headers = {
                 'service-host': 'core.content.cms.api',
@@ -246,7 +293,6 @@ class AudioFingerprintProcessor:
             response.raise_for_status()
             result = response.json()
             
-            # Extract download URL from API response
             if 'data' in result and 'downloadArtifactResponses' in result['data']:
                 responses = result['data']['downloadArtifactResponses']
                 for key, response in responses.items():
@@ -261,23 +307,18 @@ class AudioFingerprintProcessor:
             return None
     
     def download_audio_file(self, file_key: str, source: str, temp_dir: Path) -> Optional[Path]:
-        """
-        Download audio file using Artlist/MotionArray API
-        """
+        """Download audio file using Artlist/MotionArray API"""
         try:
-            # Get signed download URL from API
             download_url = self.get_download_url_from_api(file_key, source)
             if not download_url:
                 return None
             
-            # Extract filename from file_key
             filename = Path(file_key).name
             if not any(filename.endswith(ext) for ext in ['.mp3', '.wav', '.flac', '.m4a']):
-                filename += '.mp3'  # Default extension
+                filename += '.mp3'
             
             temp_file = temp_dir / filename
             
-            # Download using requests (same as utils.py)
             import requests
             response = requests.get(download_url, stream=True, timeout=60)
             response.raise_for_status()
@@ -288,24 +329,8 @@ class AudioFingerprintProcessor:
                         f.write(chunk)
             
             if temp_file.exists() and temp_file.stat().st_size > 0:
-                file_size = temp_file.stat().st_size
-                logger.info(f"✅ Downloaded: {filename} ({file_size} bytes)")
-                
-                # Check if it's actually an audio file by looking at first few bytes
-                with open(temp_file, 'rb') as f:
-                    header = f.read(16)
-                    header_hex = header.hex()[:32]
-                    logger.debug(f"📄 File header: {header_hex}")
-                    
-                    # Check for common audio file signatures
-                    if header.startswith(b'ID3') or header[4:8] == b'ftyp' or header.startswith(b'RIFF'):
-                        logger.debug(f"✅ Appears to be valid audio file")
-                    else:
-                        logger.warning(f"⚠️  File may not be valid audio - header: {header_hex}")
-                
                 return temp_file
             else:
-                logger.warning(f"⚠️  Download failed or empty file: {filename}")
                 return None
                 
         except Exception as e:
@@ -315,24 +340,14 @@ class AudioFingerprintProcessor:
     def generate_fingerprint(self, file_path: Path) -> Optional[Tuple[float, str]]:
         """Generate fingerprint with robust error handling"""
         try:
-            # Check file size (skip very large files)
-            file_size = file_path.stat().st_size
-            logger.debug(f"📁 File size: {file_size / (1024*1024):.1f}MB")
-
-            # Generate fingerprint
             duration, fingerprint = self.acoustid.fingerprint_file(str(file_path))
             
-            # Ensure fingerprint is a string (not binary)
             if isinstance(fingerprint, bytes):
                 fingerprint = fingerprint.decode('utf-8')
             
-            logger.info(f"🎵 Generated fingerprint: duration={duration:.1f}s, fp_type={type(fingerprint)}, fp_len={len(fingerprint) if fingerprint else 0}")
-            
             if duration > 0 and fingerprint:
-                logger.debug(f"✅ Fingerprint generated: {file_path.name} ({duration:.1f}s)")
                 return float(duration), fingerprint
             else:
-                logger.warning(f"⚠️  Invalid fingerprint data: {file_path.name}")
                 return None
                 
         except Exception as e:
@@ -341,7 +356,7 @@ class AudioFingerprintProcessor:
     
     def store_fingerprint(self, asset_id: str, file_key: str, format_ext: str, 
                          duration: float, fingerprint: str, file_size: int, source: str):
-        """Store fingerprint in Snowflake"""
+        """Store fingerprint in Snowflake (thread-safe)"""
         insert_sql = """
         INSERT INTO AI_DATA.AUDIO_FINGERPRINT 
         (ASSET_ID, FILE_KEY, FORMAT, DURATION, FINGERPRINT, FILE_SIZE, SOURCE, PROCESSING_STATUS)
@@ -349,7 +364,9 @@ class AudioFingerprintProcessor:
         """
         
         try:
-            self.snowflake.execute_query(insert_sql, {
+            # Create a new connection for this thread
+            thread_snowflake = SnowflakeConnector()
+            thread_snowflake.execute_query(insert_sql, {
                 'asset_id': asset_id,
                 'file_key': file_key,
                 'format': format_ext,
@@ -358,14 +375,14 @@ class AudioFingerprintProcessor:
                 'file_size': file_size,
                 'source': source
             })
-            logger.debug(f"✅ Stored fingerprint: {asset_id}")
+            thread_snowflake.close()
         except Exception as e:
             logger.error(f"❌ Failed to store fingerprint: {asset_id} - {e}")
             raise
     
     def store_error(self, asset_id: str, file_key: str, format_ext: str, 
                    file_size: int, source: str, error_message: str):
-        """Store processing error in Snowflake"""
+        """Store processing error in Snowflake (thread-safe)"""
         insert_sql = """
         INSERT INTO AI_DATA.AUDIO_FINGERPRINT 
         (ASSET_ID, FILE_KEY, FORMAT, FILE_SIZE, SOURCE, PROCESSING_STATUS, ERROR_MESSAGE)
@@ -373,7 +390,8 @@ class AudioFingerprintProcessor:
         """
         
         try:
-            self.snowflake.execute_query(insert_sql, {
+            thread_snowflake = SnowflakeConnector()
+            thread_snowflake.execute_query(insert_sql, {
                 'asset_id': asset_id,
                 'file_key': file_key,
                 'format': format_ext,
@@ -381,26 +399,26 @@ class AudioFingerprintProcessor:
                 'source': source,
                 'error_message': error_message
             })
+            thread_snowflake.close()
         except Exception as e:
             logger.error(f"❌ Failed to store error: {asset_id} - {e}")
     
-    def process_asset(self, asset_data: Dict) -> bool:
-        """Process a single asset"""
-        # Debug: print the asset_data structure
-        logger.debug(f"Asset data structure: {asset_data}")
-        logger.debug(f"Asset data keys: {list(asset_data.keys()) if isinstance(asset_data, dict) else 'Not a dict'}")
-        
+    def process_single_asset(self, asset_data: Dict) -> bool:
+        """Process a single asset (thread-safe version)"""
         asset_id = asset_data['ASSET_ID']
         file_key = asset_data['FILE_KEY']
         file_format = asset_data.get('FILE_FORMAT', 'mp3')
         file_size = asset_data.get('FILE_SIZE', 0)
         source = asset_data.get('SOURCE', 'artlist')
         
-        logger.info(f"🎵 Processing asset: {asset_id} ({file_key})")
+        thread_name = threading.current_thread().name
+        logger.info(f"🎵 [{thread_name}] Processing: {asset_id} ({file_key})")
         
         try:
-            # Download file using API
-            temp_file = self.download_audio_file(file_key, source, self.temp_dir)
+            temp_dir = self.get_thread_temp_dir()
+            
+            # Download file
+            temp_file = self.download_audio_file(file_key, source, temp_dir)
             if not temp_file:
                 self.store_error(asset_id, file_key, file_format, file_size, source, "Download failed")
                 return False
@@ -416,151 +434,157 @@ class AudioFingerprintProcessor:
             # Store in Snowflake
             self.store_fingerprint(asset_id, file_key, file_format, duration, fingerprint, file_size, source)
             
-            # Clean up temp file to save disk space
+            # Clean up temp file
             temp_file.unlink()
-            logger.debug(f"🗑️  Cleaned up temp file: {temp_file.name}")
             
-            logger.info(f"✅ Completed: {asset_id} ({duration:.1f}s)")
+            # Update stats (thread-safe)
+            with self.stats_lock:
+                self.stats['successful'] += 1
+                self.stats['processed'] += 1
+            
+            logger.info(f"✅ [{thread_name}] Completed: {asset_id} ({duration:.1f}s)")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Processing failed: {asset_id} - {e}")
-            
-            # Clean up temp file even on error
-            if 'temp_file' in locals() and temp_file and temp_file.exists():
-                temp_file.unlink()
-                logger.debug(f"🗑️  Cleaned up temp file after error: {temp_file.name}")
+            logger.error(f"❌ [{thread_name}] Processing failed: {asset_id} - {e}")
             
             self.store_error(asset_id, file_key, file_format, file_size, source, str(e))
+            
+            # Update stats (thread-safe)
+            with self.stats_lock:
+                self.stats['failed'] += 1
+                self.stats['processed'] += 1
+            
             return False
+        finally:
+            self.cleanup_thread_temp_dir()
     
-    def process_batch(self, asset_ids: List[str] = None, batch_size: int = 100) -> Dict:
-        """Process a batch of assets"""
-        logger.info(f"🚀 Starting batch processing (batch_size: {batch_size})")
+    def process_assets_parallel(self, assets: List[Dict]) -> Dict:
+        """Process assets using parallel processing"""
+        if not assets:
+            logger.warning("⚠️  No assets to process")
+            return {'processed': 0, 'successful': 0, 'failed': 0, 'total_time_minutes': 0}
         
-        # Ensure table exists
-        self.ensure_table_exists()
+        logger.info(f"🚀 Starting parallel processing of {len(assets)} assets with {self.max_workers} workers")
         
-        # Create temporary directory
-        with tempfile.TemporaryDirectory() as temp_dir:
-            self.temp_dir = Path(temp_dir)
-            
-            # Get assets to process
-            assets = self.get_asset_file_keys(asset_ids, batch_size)
-            if not assets:
-                logger.warning("⚠️  No assets found to process")
-                return {'processed': 0, 'successful': 0, 'failed': 0}
-            
-            logger.info(f"📊 Found {len(assets)} assets to process")
-            
-            # Process assets
-            successful = 0
-            failed = 0
-            start_time = time.time()
-            
-            for i, asset_data in enumerate(assets, 1):
-                logger.info(f"Progress: {i}/{len(assets)} ({i/len(assets)*100:.1f}%)")
-                
-                if self.process_asset(asset_data):
-                    successful += 1
-                else:
-                    failed += 1
-                
-                # Progress update every 10 assets
-                if i % 10 == 0:
-                    elapsed = time.time() - start_time
-                    rate = i / elapsed
-                    eta = (len(assets) - i) / rate if rate > 0 else 0
-                    logger.info(f"📈 Rate: {rate:.1f} assets/sec, ETA: {eta/60:.1f}min")
-            
-            total_time = time.time() - start_time
-            
-            results = {
-                'processed': len(assets),
-                'successful': successful,
-                'failed': failed,
-                'total_time_minutes': total_time / 60,
-                'rate_per_second': len(assets) / total_time
+        # Initialize stats
+        with self.stats_lock:
+            self.stats = {
+                'processed': 0,
+                'successful': 0,
+                'failed': 0,
+                'start_time': time.time()
             }
-            
-            logger.info(f"✅ Batch complete: {successful}/{len(assets)} successful ({total_time/60:.1f}min)")
-            return results
-    
-    def get_processing_stats(self) -> Dict:
-        """Get processing statistics from Snowflake"""
-        stats_sql = """
-        SELECT 
-            COUNT(*) as total_records,
-            COUNT(CASE WHEN processing_status = 'SUCCESS' THEN 1 END) as successful,
-            COUNT(CASE WHEN processing_status = 'ERROR' THEN 1 END) as failed,
-            AVG(CASE WHEN processing_status = 'SUCCESS' THEN duration END) as avg_duration,
-            MIN(created_at) as first_processed,
-            MAX(created_at) as last_processed
-        FROM AI_DATA.AUDIO_FINGERPRINT
-        """
         
-        try:
-            cursor = self.snowflake.execute_query(stats_sql)
-            row = cursor.fetchone()
-            if row:
-                columns = [desc[0] for desc in cursor.description]
-                return dict(zip(columns, row))
-            else:
-                return {}
-        except Exception as e:
-            logger.error(f"❌ Failed to get stats: {e}")
-            return {}
+        # Process assets in parallel
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_asset = {executor.submit(self.process_single_asset, asset): asset for asset in assets}
+            
+            # Process completed tasks
+            for i, future in enumerate(as_completed(future_to_asset), 1):
+                try:
+                    future.result()  # This will raise any exception that occurred
+                except Exception as e:
+                    asset = future_to_asset[future]
+                    logger.error(f"❌ Task failed for asset {asset.get('ASSET_ID', 'unknown')}: {e}")
+                
+                # Progress update
+                if i % 10 == 0 or i == len(assets):
+                    with self.stats_lock:
+                        elapsed = time.time() - self.stats['start_time']
+                        rate = self.stats['processed'] / elapsed if elapsed > 0 else 0
+                        eta = (len(assets) - self.stats['processed']) / rate if rate > 0 else 0
+                        
+                        logger.info(f"📈 Progress: {self.stats['processed']}/{len(assets)} "
+                                  f"({self.stats['processed']/len(assets)*100:.1f}%) | "
+                                  f"Rate: {rate:.1f}/sec | ETA: {eta/60:.1f}min | "
+                                  f"Success: {self.stats['successful']} | Failed: {self.stats['failed']}")
+        
+        # Final results
+        with self.stats_lock:
+            total_time = time.time() - self.stats['start_time']
+            results = {
+                'processed': self.stats['processed'],
+                'successful': self.stats['successful'],
+                'failed': self.stats['failed'],
+                'total_time_minutes': total_time / 60,
+                'rate_per_second': self.stats['processed'] / total_time if total_time > 0 else 0
+            }
+        
+        logger.info(f"✅ Parallel processing complete: {results['successful']}/{results['processed']} successful "
+                   f"({total_time/60:.1f}min, {results['rate_per_second']:.1f} assets/sec)")
+        
+        return results
 
 def main():
-    parser = argparse.ArgumentParser(description='Audio Fingerprint Processor for Production')
+    parser = argparse.ArgumentParser(description='Enhanced Audio Fingerprint Processor with Parallel Processing')
+    parser.add_argument('--source', choices=['artlist', 'motionarray'], 
+                       help='Process ALL songs from specific source')
     parser.add_argument('--asset-ids', help='Comma-separated list of asset IDs to process')
-    parser.add_argument('--batch-size', type=int, default=100, help='Batch size for processing')
-    parser.add_argument('--resume', action='store_true', help='Resume processing unprocessed assets')
+    parser.add_argument('--workers', type=int, default=4, 
+                       help='Number of parallel workers (default: 4)')
     parser.add_argument('--stats', action='store_true', help='Show processing statistics')
     
     args = parser.parse_args()
     
-    # Initialize processor (uses existing Snowflake credential management)
+    # Validate arguments
+    if not args.source and not args.asset_ids and not args.stats:
+        parser.error("Must specify either --source, --asset-ids, or --stats")
+    
+    # Initialize processor
     try:
-        processor = AudioFingerprintProcessor()
+        processor = EnhancedAudioFingerprintProcessor(max_workers=args.workers)
+        processor.ensure_table_exists()
     except Exception as e:
         logger.error(f"❌ Failed to initialize processor: {e}")
         return 1
     
     # Show stats if requested
     if args.stats:
-        stats = processor.get_processing_stats()
+        # Use original processor for stats (compatibility)
+        from audio_fingerprint_processor import AudioFingerprintProcessor
+        original_processor = AudioFingerprintProcessor()
+        stats = original_processor.get_processing_stats()
         print("\n📊 Processing Statistics:")
         for key, value in stats.items():
             print(f"   {key}: {value}")
         return 0
     
-    # Parse asset IDs
-    asset_ids = None
-    if args.asset_ids:
-        asset_ids = [aid.strip() for aid in args.asset_ids.split(',')]
-        logger.info(f"🎯 Processing specific assets: {asset_ids}")
-    elif args.resume:
-        logger.info("🔄 Resuming processing of unprocessed assets")
-    else:
-        logger.info(f"🚀 Processing next {args.batch_size} unprocessed assets")
-    
-    # Process batch
+    # Get assets to process
     try:
-        results = processor.process_batch(asset_ids, args.batch_size)
+        if args.source:
+            logger.info(f"🎯 Processing ALL {args.source} songs")
+            assets = processor.get_all_assets_by_source(args.source)
+        elif args.asset_ids:
+            asset_ids = [aid.strip() for aid in args.asset_ids.split(',')]
+            logger.info(f"🎯 Processing specific assets: {asset_ids}")
+            assets = processor.get_asset_file_keys(asset_ids)
+        else:
+            assets = []
         
+        if not assets:
+            logger.warning("⚠️  No assets found to process")
+            return 0
+        
+        # Process assets
+        results = processor.process_assets_parallel(assets)
+        
+        # Print final results
         print(f"\n📊 Final Results:")
-        print(f"   Processed: {results['processed']} assets")
+        print(f"   Total Assets: {len(assets)}")
+        print(f"   Processed: {results['processed']}")
         print(f"   Successful: {results['successful']}")
         print(f"   Failed: {results['failed']}")
         print(f"   Success Rate: {results['successful']/results['processed']*100:.1f}%")
         print(f"   Total Time: {results['total_time_minutes']:.1f} minutes")
         print(f"   Processing Rate: {results['rate_per_second']:.1f} assets/second")
+        print(f"   Parallel Workers: {args.workers}")
         
         return 0 if results['failed'] == 0 else 1
         
     except Exception as e:
-        logger.error(f"❌ Batch processing failed: {e}")
+        logger.error(f"❌ Processing failed: {e}")
         return 1
 
 if __name__ == "__main__":
