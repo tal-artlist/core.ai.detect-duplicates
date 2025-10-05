@@ -14,6 +14,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import threading
+from threading import local
 
 # Auto-restart with correct environment if needed
 if 'DYLD_LIBRARY_PATH' not in os.environ or '/opt/homebrew/lib' not in os.environ.get('DYLD_LIBRARY_PATH', ''):
@@ -44,6 +45,7 @@ class AudioFingerprintProcessor:
         self.acoustid = self.setup_chromaprint()
         self.max_workers = max_workers
         self.temp_dirs = {}  # Thread-safe temp directory management
+        self.thread_local = local()  # Thread-local storage for connections
         self.stats_lock = Lock()
         self.stats = {
             'processed': 0,
@@ -100,52 +102,88 @@ class AudioFingerprintProcessor:
         """
         if source.lower() == 'artlist':
             query = """
-            SELECT
+            WITH base AS (
+              SELECT
                 da.asset_id::string as asset_id,
                 sf.filekey AS file_key,
                 CASE WHEN sf.role = 'CORE' THEN 'wav' ELSE LOWER(sf.role) END AS file_format,
                 0 as file_size,
-                'artlist' as source
-            FROM BI_PROD.dwh.DIM_ASSETS da
-            JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_ASSET a
+                'artlist' as source,
+                sf.createdat as created_at
+              FROM BI_PROD.dwh.DIM_ASSETS da
+              JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_ASSET a
                 ON da.asset_id::string = a.externalid::int::string
-            JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_songFILE sf
+              JOIN ODS_PROD.cross_products_ods.POSTGRES_ASM_songFILE sf
                 ON a.id = sf.songid
-            LEFT JOIN AI_DATA.AUDIO_FINGERPRINT af 
+              LEFT JOIN AI_DATA.AUDIO_FINGERPRINT af 
                 ON da.asset_id::string = af.asset_id AND sf.filekey = af.file_key
-            WHERE da.product_indicator = 1
+              WHERE da.product_indicator = 1
                 AND da.asset_type = 'Music'
                 AND sf.role IN ('CORE', 'MP3')
                 AND af.asset_id IS NULL  -- Only unprocessed
-            ORDER BY da.asset_id
+            ),
+            deduplicated AS (
+              SELECT asset_id, file_key, file_format, file_size, source
+              FROM (
+                SELECT
+                  asset_id, file_key, file_format, file_size, source, created_at,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY asset_id, file_format
+                    ORDER BY created_at DESC, file_key
+                  ) AS rn
+                FROM base
+              )
+              WHERE rn = 1
+            )
+            SELECT asset_id, file_key, file_format, file_size, source
+            FROM deduplicated
+            ORDER BY asset_id
             """
         elif source.lower() == 'motionarray':
             query = """
-            SELECT
+            WITH base AS (
+              SELECT
                 a.asset_id::string as asset_id,
                 b.guid AS file_key,
                 CASE
-                    WHEN pf.format_id = 1 THEN 'wav'
-                    WHEN pf.format_id = 2 THEN 'mp3'
-                    WHEN pf.format_id = 3 THEN 'aiff'
-                    ELSE 'mp3'
+                  WHEN pf.format_id = 1 THEN 'wav'
+                  WHEN pf.format_id = 2 THEN 'mp3'
+                  WHEN pf.format_id = 3 THEN 'aiff'
+                  ELSE 'mp3'
                 END AS file_format,
                 0 as file_size,
-                'motionarray' as source
-            FROM BI_PROD.dwh.DIM_ASSETS a
-            JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_RESOLUTIONS b
+                'motionarray' as source,
+                c.created_at
+              FROM BI_PROD.dwh.DIM_ASSETS a
+              JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_RESOLUTIONS b
                 ON a.asset_id::string = b.product_id::string
-            JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_AUDIO_RESOLUTIONS c
+              JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_CMS_AUDIO_RESOLUTIONS c
                 ON b.id = c.parent_id
-            LEFT JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_FORMAT pf
+              LEFT JOIN ODS_PROD.motion_array_ods.MYSQL_PRODUCT_FORMAT pf
                 ON pf.product_id = a.asset_id
-            LEFT JOIN AI_DATA.AUDIO_FINGERPRINT af 
+              LEFT JOIN AI_DATA.AUDIO_FINGERPRINT af 
                 ON a.asset_id::string = af.asset_id AND b.guid = af.file_key
-            WHERE a.product_indicator = 3
+              WHERE a.product_indicator = 3
                 AND a.asset_sub_type ILIKE '%music%'
                 AND b.resolution_format = 1
                 AND af.asset_id IS NULL  -- Only unprocessed
-            ORDER BY a.asset_id
+            ),
+            deduplicated AS (
+              SELECT asset_id, file_key, file_format, file_size, source
+              FROM (
+                SELECT
+                  asset_id, file_key, file_format, file_size, source, created_at,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY asset_id, file_format
+                    ORDER BY created_at DESC, file_key
+                  ) AS rn
+                FROM base
+              )
+              WHERE rn = 1
+            )
+            SELECT asset_id, file_key, file_format, file_size, source
+            FROM deduplicated
+            ORDER BY asset_id
             """
         else:
             raise ValueError(f"Invalid source: {source}. Must be 'artlist' or 'motionarray'")
@@ -240,6 +278,13 @@ class AudioFingerprintProcessor:
             self.temp_dirs[thread_id] = tempfile.mkdtemp(prefix=f"audio_fp_thread_{thread_id}_")
         return Path(self.temp_dirs[thread_id])
     
+    def get_thread_snowflake(self) -> SnowflakeConnector:
+        """Get or create thread-local Snowflake connection"""
+        if not hasattr(self.thread_local, 'snowflake'):
+            self.thread_local.snowflake = SnowflakeConnector()
+            logger.info(f"🔗 [{threading.current_thread().name}] Created thread-local Snowflake connection")
+        return self.thread_local.snowflake
+    
     def cleanup_thread_temp_dir(self):
         """Clean up thread-specific temporary directory"""
         thread_id = threading.current_thread().ident
@@ -250,6 +295,16 @@ class AudioFingerprintProcessor:
                 del self.temp_dirs[thread_id]
             except Exception as e:
                 logger.warning(f"⚠️  Failed to cleanup temp dir for thread {thread_id}: {e}")
+    
+    def cleanup_thread_connection(self):
+        """Clean up thread-local Snowflake connection"""
+        if hasattr(self.thread_local, 'snowflake'):
+            try:
+                self.thread_local.snowflake.close()
+                delattr(self.thread_local, 'snowflake')
+                logger.info(f"🔌 [{threading.current_thread().name}] Closed thread-local Snowflake connection")
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to cleanup connection for thread: {e}")
     
     def get_download_url_from_api(self, file_key: str, source: str) -> Optional[str]:
         """Get signed download URL from Artlist/MotionArray API"""
@@ -345,9 +400,9 @@ class AudioFingerprintProcessor:
         """
         
         try:
-            # Create a new connection for this thread
-            thread_snowflake = SnowflakeConnector()
-            thread_snowflake.execute_query(insert_sql, {
+            # Use thread-local connection (reused across calls in same thread)
+            thread_snowflake = self.get_thread_snowflake()
+            cursor = thread_snowflake.execute_query(insert_sql, {
                 'asset_id': asset_id,
                 'file_key': file_key,
                 'format': format_ext,
@@ -356,7 +411,7 @@ class AudioFingerprintProcessor:
                 'file_size': file_size,
                 'source': source
             })
-            thread_snowflake.close()
+            cursor.close()  # Close cursor after use
         except Exception as e:
             logger.error(f"❌ Failed to store fingerprint: {asset_id} - {e}")
             raise
@@ -371,8 +426,9 @@ class AudioFingerprintProcessor:
         """
         
         try:
-            thread_snowflake = SnowflakeConnector()
-            thread_snowflake.execute_query(insert_sql, {
+            # Use thread-local connection (reused across calls in same thread)
+            thread_snowflake = self.get_thread_snowflake()
+            cursor = thread_snowflake.execute_query(insert_sql, {
                 'asset_id': asset_id,
                 'file_key': file_key,
                 'format': format_ext,
@@ -380,7 +436,7 @@ class AudioFingerprintProcessor:
                 'source': source,
                 'error_message': error_message
             })
-            thread_snowflake.close()
+            cursor.close()  # Close cursor after use
         except Exception as e:
             logger.error(f"❌ Failed to store error: {asset_id} - {e}")
     
@@ -439,6 +495,7 @@ class AudioFingerprintProcessor:
             return False
         finally:
             self.cleanup_thread_temp_dir()
+            # Don't cleanup connection here - let it be reused for next asset in same thread
     
     def process_assets_parallel(self, assets: List[Dict]) -> Dict:
         """Process assets using parallel processing"""
@@ -481,6 +538,11 @@ class AudioFingerprintProcessor:
                                   f"({self.stats['processed']/len(assets)*100:.1f}%) | "
                                   f"Rate: {rate:.1f}/sec | ETA: {eta/60:.1f}min | "
                                   f"Success: {self.stats['successful']} | Failed: {self.stats['failed']}")
+        
+        # Clean up all thread-local connections after executor completes
+        logger.info("Cleaning up thread-local connections...")
+        # Note: ThreadPoolExecutor threads are already shut down at this point,
+        # so connections are closed when threads terminate
         
         # Final results
         with self.stats_lock:

@@ -27,6 +27,18 @@ class SnowflakeConnector:
             raise ImportError("Snowflake/GCP dependencies not available")
         self.config = config or {}
         self._connection = None
+        
+        # Check for environment variables as fallback
+        import os
+        if not self.config and all(key in os.environ for key in ['SNOWFLAKE_USER', 'SNOWFLAKE_PASSWORD', 'SNOWFLAKE_ACCOUNT']):
+            self.config = {
+                'user': os.environ['SNOWFLAKE_USER'],
+                'password': os.environ['SNOWFLAKE_PASSWORD'], 
+                'account': os.environ['SNOWFLAKE_ACCOUNT'],
+                'warehouse': os.environ.get('SNOWFLAKE_WAREHOUSE', 'COMPUTE_WH'),
+                'database': 'BI_PROD',
+                'schema': 'AI_DATA'
+            }
     
     def get_snowflake_secret(self, secret_id: str = "ai_team_snowflake_credentials", 
                            project_id: str = "889375371783") -> Optional[Dict[str, Any]]:
@@ -73,6 +85,12 @@ class SnowflakeConnector:
             if "schema" not in creds:
                 creds["schema"] = "AI_DATA"
             
+            # Add connection timeout settings to prevent hanging
+            if "login_timeout" not in creds:
+                creds["login_timeout"] = 30  # 30 seconds to establish connection
+            if "network_timeout" not in creds:
+                creds["network_timeout"] = 60  # 60 seconds for query operations
+            
             # Connect
             self._connection = snowflake.connector.connect(**creds)
         
@@ -88,6 +106,9 @@ class SnowflakeConnector:
                 cursor.execute(query, params)
             else:
                 cursor.execute(query)
+            # Commit the transaction immediately for write operations
+            if query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'CREATE')):
+                conn.commit()
             return cursor
         except Exception as e:
             cursor.close()
