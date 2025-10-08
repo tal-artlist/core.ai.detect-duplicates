@@ -15,13 +15,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import threading
 from threading import local
+import platform
+import shutil
 
-# Auto-restart with correct environment if needed
-if 'DYLD_LIBRARY_PATH' not in os.environ or '/opt/homebrew/lib' not in os.environ.get('DYLD_LIBRARY_PATH', ''):
-    env = os.environ.copy()
-    env['DYLD_LIBRARY_PATH'] = '/opt/homebrew/lib:' + env.get('DYLD_LIBRARY_PATH', '')
-    result = subprocess.run([sys.executable] + sys.argv, env=env)
-    sys.exit(result.returncode)
+# Platform-specific library path detection
+SYSTEM = platform.system()
+
+# Auto-restart with correct environment if needed (platform-specific)
+if SYSTEM == 'Darwin':  # macOS
+    if 'DYLD_LIBRARY_PATH' not in os.environ or '/opt/homebrew/lib' not in os.environ.get('DYLD_LIBRARY_PATH', ''):
+        env = os.environ.copy()
+        env['DYLD_LIBRARY_PATH'] = '/opt/homebrew/lib:' + env.get('DYLD_LIBRARY_PATH', '')
+        result = subprocess.run([sys.executable] + sys.argv, env=env)
+        sys.exit(result.returncode)
+elif SYSTEM == 'Linux':
+    # On Linux, LD_LIBRARY_PATH may be needed for custom installs
+    # Usually system packages work without this
+    pass
 
 import ctypes
 import pandas as pd
@@ -55,19 +65,79 @@ class AudioFingerprintProcessor:
         }
         
     def setup_chromaprint(self):
-        """Set up Chromaprint library and environment"""
+        """Set up Chromaprint library and environment (cross-platform)"""
         try:
-            chromaprint_lib = ctypes.CDLL('/opt/homebrew/lib/libchromaprint.dylib')
+            # Platform-specific library loading
+            chromaprint_lib = None
+            if SYSTEM == 'Darwin':  # macOS
+                lib_paths = [
+                    '/opt/homebrew/lib/libchromaprint.dylib',
+                    '/usr/local/lib/libchromaprint.dylib'
+                ]
+                for lib_path in lib_paths:
+                    if os.path.exists(lib_path):
+                        chromaprint_lib = ctypes.CDLL(lib_path)
+                        logger.info(f"✅ Loaded chromaprint library from: {lib_path}")
+                        break
+            elif SYSTEM == 'Linux':
+                lib_paths = [
+                    'libchromaprint.so.1',  # Try system library first
+                    'libchromaprint.so',
+                    '/lib/x86_64-linux-gnu/libchromaprint.so.1',
+                    '/lib/x86_64-linux-gnu/libchromaprint.so',
+                    '/usr/lib/x86_64-linux-gnu/libchromaprint.so.1',
+                    '/usr/lib/libchromaprint.so.1',
+                    '/usr/local/lib/libchromaprint.so.1'
+                ]
+                for lib_path in lib_paths:
+                    try:
+                        chromaprint_lib = ctypes.CDLL(lib_path)
+                        logger.info(f"✅ Loaded chromaprint library: {lib_path}")
+                        break
+                    except OSError:
+                        continue
+            
+            if not chromaprint_lib:
+                raise RuntimeError(f"Could not find chromaprint library for {SYSTEM}")
+            
+            # Import acoustid after library is loaded
             import acoustid
             
-            fpcalc_path = "/opt/homebrew/bin/fpcalc"
+            # Find fpcalc binary
+            fpcalc_path = shutil.which('fpcalc')
+            if not fpcalc_path:
+                # Try platform-specific paths
+                if SYSTEM == 'Darwin':
+                    candidate_paths = ['/opt/homebrew/bin/fpcalc', '/usr/local/bin/fpcalc']
+                else:  # Linux
+                    candidate_paths = ['/usr/bin/fpcalc', '/usr/local/bin/fpcalc']
+                
+                for path in candidate_paths:
+                    if os.path.exists(path):
+                        fpcalc_path = path
+                        break
+            
+            if not fpcalc_path:
+                if SYSTEM == 'Linux':
+                    raise RuntimeError(
+                        f"Could not find fpcalc binary. Please install it:\n"
+                        f"  Ubuntu/Debian: sudo apt-get install libchromaprint-tools\n"
+                        f"  Fedora/RHEL: sudo dnf install chromaprint-tools\n"
+                        f"  Arch: sudo pacman -S chromaprint"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Could not find fpcalc binary. Please install it:\n"
+                        f"  macOS: brew install chromaprint"
+                    )
+            
             os.environ['FPCALC_COMMAND'] = fpcalc_path
             acoustid.FPCALC_COMMAND = fpcalc_path
             
-            logger.info("✅ Chromaprint setup successful")
+            logger.info(f"✅ Chromaprint setup successful on {SYSTEM} (fpcalc: {fpcalc_path})")
             return acoustid
         except Exception as e:
-            logger.error(f"❌ Chromaprint setup failed: {e}")
+            logger.error(f"❌ Chromaprint setup failed on {SYSTEM}: {e}")
             raise
     
     def ensure_table_exists(self):
@@ -96,9 +166,13 @@ class AudioFingerprintProcessor:
             logger.error(f"❌ Failed to create table: {e}")
             raise
     
-    def get_all_assets_by_source(self, source: str) -> List[Dict]:
+    def get_all_assets_by_source(self, source: str, retry_errors: bool = False) -> List[Dict]:
         """
         Get ALL assets from a specific source (artlist or motionarray)
+        
+        Args:
+            source: 'artlist' or 'motionarray'
+            retry_errors: If True, include assets with ERROR status for reprocessing
         """
         if source.lower() == 'artlist':
             query = """
@@ -120,7 +194,7 @@ class AudioFingerprintProcessor:
               WHERE da.product_indicator = 1
                 AND da.asset_type = 'Music'
                 AND sf.role IN ('CORE', 'MP3')
-                AND af.asset_id IS NULL  -- Only unprocessed
+                AND (af.asset_id IS NULL {retry_condition})  -- Unprocessed or errors
             ),
             deduplicated AS (
               SELECT asset_id, file_key, file_format, file_size, source
@@ -139,6 +213,9 @@ class AudioFingerprintProcessor:
             FROM deduplicated
             ORDER BY asset_id
             """
+            retry_condition = "OR af.processing_status = 'ERROR'" if retry_errors else ""
+            query = query.format(retry_condition=retry_condition)
+            
         elif source.lower() == 'motionarray':
             query = """
             WITH base AS (
@@ -166,7 +243,7 @@ class AudioFingerprintProcessor:
               WHERE a.product_indicator = 3
                 AND a.asset_sub_type ILIKE '%music%'
                 AND b.resolution_format = 1
-                AND af.asset_id IS NULL  -- Only unprocessed
+                AND (af.asset_id IS NULL {retry_condition})  -- Unprocessed or errors
             ),
             deduplicated AS (
               SELECT asset_id, file_key, file_format, file_size, source
@@ -185,6 +262,8 @@ class AudioFingerprintProcessor:
             FROM deduplicated
             ORDER BY asset_id
             """
+            retry_condition = "OR af.processing_status = 'ERROR'" if retry_errors else ""
+            query = query.format(retry_condition=retry_condition)
         else:
             raise ValueError(f"Invalid source: {source}. Must be 'artlist' or 'motionarray'")
         
@@ -289,7 +368,6 @@ class AudioFingerprintProcessor:
         """Clean up thread-specific temporary directory"""
         thread_id = threading.current_thread().ident
         if thread_id in self.temp_dirs:
-            import shutil
             try:
                 shutil.rmtree(self.temp_dirs[thread_id])
                 del self.temp_dirs[thread_id]
@@ -390,9 +468,30 @@ class AudioFingerprintProcessor:
             logger.warning(f"❌ Fingerprint error: {file_path.name} - {e}")
             return None
     
+    def delete_existing_record(self, asset_id: str, file_key: str):
+        """Delete existing record (used when retrying errors) (thread-safe)"""
+        delete_sql = """
+        DELETE FROM AI_DATA.AUDIO_FINGERPRINT 
+        WHERE ASSET_ID = %(asset_id)s AND FILE_KEY = %(file_key)s
+        """
+        try:
+            thread_snowflake = self.get_thread_snowflake()
+            cursor = thread_snowflake.execute_query(delete_sql, {
+                'asset_id': asset_id,
+                'file_key': file_key
+            })
+            cursor.close()
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to delete existing record: {asset_id} - {e}")
+    
     def store_fingerprint(self, asset_id: str, file_key: str, format_ext: str, 
-                         duration: float, fingerprint: str, file_size: int, source: str):
+                         duration: float, fingerprint: str, file_size: int, source: str,
+                         is_retry: bool = False):
         """Store fingerprint in Snowflake (thread-safe)"""
+        # Delete old record if this is a retry
+        if is_retry:
+            self.delete_existing_record(asset_id, file_key)
+        
         insert_sql = """
         INSERT INTO AI_DATA.AUDIO_FINGERPRINT 
         (ASSET_ID, FILE_KEY, FORMAT, DURATION, FINGERPRINT, FILE_SIZE, SOURCE, PROCESSING_STATUS)
@@ -417,8 +516,12 @@ class AudioFingerprintProcessor:
             raise
     
     def store_error(self, asset_id: str, file_key: str, format_ext: str, 
-                   file_size: int, source: str, error_message: str):
+                   file_size: int, source: str, error_message: str, is_retry: bool = False):
         """Store processing error in Snowflake (thread-safe)"""
+        # Delete old record if this is a retry
+        if is_retry:
+            self.delete_existing_record(asset_id, file_key)
+        
         insert_sql = """
         INSERT INTO AI_DATA.AUDIO_FINGERPRINT 
         (ASSET_ID, FILE_KEY, FORMAT, FILE_SIZE, SOURCE, PROCESSING_STATUS, ERROR_MESSAGE)
@@ -440,7 +543,7 @@ class AudioFingerprintProcessor:
         except Exception as e:
             logger.error(f"❌ Failed to store error: {asset_id} - {e}")
     
-    def process_single_asset(self, asset_data: Dict) -> bool:
+    def process_single_asset(self, asset_data: Dict, is_retry: bool = False) -> bool:
         """Process a single asset (thread-safe version)"""
         asset_id = asset_data['ASSET_ID']
         file_key = asset_data['FILE_KEY']
@@ -450,7 +553,8 @@ class AudioFingerprintProcessor:
         
         thread_name = threading.current_thread().name
         start_time = time.time()
-        logger.info(f"🎵 [{thread_name}] Processing: {asset_id} ({file_key})")
+        retry_msg = "[RETRY] " if is_retry else ""
+        logger.info(f"🎵 [{thread_name}] {retry_msg}Processing: {asset_id} ({file_key})")
         
         try:
             temp_dir = self.get_thread_temp_dir()
@@ -458,19 +562,19 @@ class AudioFingerprintProcessor:
             # Download file
             temp_file = self.download_audio_file(file_key, source, temp_dir)
             if not temp_file:
-                self.store_error(asset_id, file_key, file_format, file_size, source, "Download failed")
+                self.store_error(asset_id, file_key, file_format, file_size, source, "Download failed", is_retry)
                 return False
             
             # Generate fingerprint
             result = self.generate_fingerprint(temp_file)
             if not result:
-                self.store_error(asset_id, file_key, file_format, file_size, source, "Fingerprint generation failed")
+                self.store_error(asset_id, file_key, file_format, file_size, source, "Fingerprint generation failed", is_retry)
                 return False
             
             duration, fingerprint = result
             
             # Store in Snowflake
-            self.store_fingerprint(asset_id, file_key, file_format, duration, fingerprint, file_size, source)
+            self.store_fingerprint(asset_id, file_key, file_format, duration, fingerprint, file_size, source, is_retry)
             
             # Clean up temp file
             temp_file.unlink()
@@ -480,13 +584,13 @@ class AudioFingerprintProcessor:
                 self.stats['successful'] += 1
                 self.stats['processed'] += 1
             processing_time = time.time() - start_time
-            logger.info(f"✅ [{thread_name}] Completed: {asset_id} ({processing_time:.1f}s processing, {duration:.1f}s audio)")
+            logger.info(f"✅ [{thread_name}] {retry_msg}Completed: {asset_id} ({processing_time:.1f}s processing, {duration:.1f}s audio)")
             return True
             
         except Exception as e:
-            logger.error(f"❌ [{thread_name}] Processing failed: {asset_id} - {e}")
+            logger.error(f"❌ [{thread_name}] {retry_msg}Processing failed: {asset_id} - {e}")
             
-            self.store_error(asset_id, file_key, file_format, file_size, source, str(e))
+            self.store_error(asset_id, file_key, file_format, file_size, source, str(e), is_retry)
             
             # Update stats (thread-safe)
             with self.stats_lock:
@@ -498,13 +602,14 @@ class AudioFingerprintProcessor:
             self.cleanup_thread_temp_dir()
             # Don't cleanup connection here - let it be reused for next asset in same thread
     
-    def process_assets_parallel(self, assets: List[Dict]) -> Dict:
+    def process_assets_parallel(self, assets: List[Dict], is_retry: bool = False) -> Dict:
         """Process assets using parallel processing"""
         if not assets:
             logger.warning("⚠️  No assets to process")
             return {'processed': 0, 'successful': 0, 'failed': 0, 'total_time_minutes': 0}
         
-        logger.info(f"🚀 Starting parallel processing of {len(assets)} assets with {self.max_workers} workers")
+        retry_msg = " (including ERROR retries)" if is_retry else ""
+        logger.info(f"🚀 Starting parallel processing of {len(assets)} assets{retry_msg} with {self.max_workers} workers")
         
         # Initialize stats
         with self.stats_lock:
@@ -518,7 +623,7 @@ class AudioFingerprintProcessor:
         # Process assets in parallel
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all tasks
-            future_to_asset = {executor.submit(self.process_single_asset, asset): asset for asset in assets}
+            future_to_asset = {executor.submit(self.process_single_asset, asset, is_retry): asset for asset in assets}
             
             # Process completed tasks
             for i, future in enumerate(as_completed(future_to_asset), 1):
@@ -593,6 +698,8 @@ def main():
     parser.add_argument('--asset-ids', help='Comma-separated list of asset IDs to process')
     parser.add_argument('--workers', type=int, default=4, 
                        help='Number of parallel workers (default: 4)')
+    parser.add_argument('--retry-errors', action='store_true',
+                       help='Retry processing assets that previously failed with ERROR status')
     parser.add_argument('--stats', action='store_true', help='Show processing statistics')
     
     args = parser.parse_args()
@@ -620,12 +727,14 @@ def main():
     # Get assets to process
     try:
         if args.source:
-            logger.info(f"🎯 Processing ALL {args.source} songs")
-            assets = processor.get_all_assets_by_source(args.source)
+            retry_msg = " (including ERROR retries)" if args.retry_errors else ""
+            logger.info(f"🎯 Processing ALL {args.source} songs{retry_msg}")
+            assets = processor.get_all_assets_by_source(args.source, retry_errors=args.retry_errors)
         elif args.asset_ids:
             asset_ids = [aid.strip() for aid in args.asset_ids.split(',')]
             logger.info(f"🎯 Processing specific assets: {asset_ids}")
             assets = processor.get_asset_file_keys(asset_ids)
+            # Note: asset_ids mode doesn't support retry_errors flag currently
         else:
             assets = []
         
@@ -634,7 +743,7 @@ def main():
             return 0
         
         # Process assets
-        results = processor.process_assets_parallel(assets)
+        results = processor.process_assets_parallel(assets, is_retry=args.retry_errors)
         
         # Print final results
         print(f"\n📊 Final Results:")
