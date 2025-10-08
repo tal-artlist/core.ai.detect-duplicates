@@ -449,6 +449,7 @@ class AudioFingerprintProcessor:
         source = asset_data.get('SOURCE', 'artlist')
         
         thread_name = threading.current_thread().name
+        start_time = time.time()
         logger.info(f"🎵 [{thread_name}] Processing: {asset_id} ({file_key})")
         
         try:
@@ -478,8 +479,8 @@ class AudioFingerprintProcessor:
             with self.stats_lock:
                 self.stats['successful'] += 1
                 self.stats['processed'] += 1
-            
-            logger.info(f"✅ [{thread_name}] Completed: {asset_id} ({duration:.1f}s)")
+            processing_time = time.time() - start_time
+            logger.info(f"✅ [{thread_name}] Completed: {asset_id} ({processing_time:.1f}s processing, {duration:.1f}s audio)")
             return True
             
         except Exception as e:
