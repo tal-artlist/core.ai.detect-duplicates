@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """
-Smart Audio Duplicate Detector
+Smart Audio Duplicate Detector - UPGRADED VERSION
 
-Loads fingerprints from Snowflake and uses duration-based clustering 
-to efficiently find duplicates without N² comparisons.
+Loads ALL fingerprints from Snowflake and uses duration-based clustering 
+with parallel processing to efficiently find duplicates.
+
+Prioritizes cross-source comparisons (artlist ↔ motionarray).
 
 Usage:
-    python duplicate_detector.py --batch-size 1000
-    python duplicate_detector.py --similarity-threshold 0.80
+    # Cross-source comparisons (priority)
+    python duplicate_detector.py --mode cross-source --workers 8
+    
+    # Same-source comparisons
+    python duplicate_detector.py --mode same-source --workers 8
+    
+    # All comparisons
+    python duplicate_detector.py --mode all --workers 8
+    
+    # Stats only
     python duplicate_detector.py --stats
 """
 
@@ -16,18 +26,30 @@ import sys
 import logging
 import argparse
 import tempfile
+import shutil
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 import subprocess
 import time
+import platform
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import ctypes
 
-# Auto-restart with correct environment if needed (same as fingerprint processor)
-if 'DYLD_LIBRARY_PATH' not in os.environ or '/opt/homebrew/lib' not in os.environ.get('DYLD_LIBRARY_PATH', ''):
-    env = os.environ.copy()
-    env['DYLD_LIBRARY_PATH'] = '/opt/homebrew/lib:' + env.get('DYLD_LIBRARY_PATH', '')
-    result = subprocess.run([sys.executable] + sys.argv, env=env)
-    sys.exit(result.returncode)
+# Platform-specific environment setup
+SYSTEM = platform.system()
+
+# Auto-restart with correct environment if needed (cross-platform)
+if SYSTEM == 'Darwin':  # macOS
+    if 'DYLD_LIBRARY_PATH' not in os.environ or '/opt/homebrew/lib' not in os.environ.get('DYLD_LIBRARY_PATH', ''):
+        env = os.environ.copy()
+        env['DYLD_LIBRARY_PATH'] = '/opt/homebrew/lib:' + env.get('DYLD_LIBRARY_PATH', '')
+        result = subprocess.run([sys.executable] + sys.argv, env=env)
+        sys.exit(result.returncode)
+elif SYSTEM == 'Linux':
+    # Linux may need LD_LIBRARY_PATH for custom installs
+    pass
 
 try:
     import acoustid
@@ -48,27 +70,79 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class DuplicateDetector:
-    """Smart duplicate detector using duration-based clustering"""
+    """Smart duplicate detector using duration-based clustering with parallel processing"""
     
-    def __init__(self):
+    def __init__(self, max_workers: int = 4):
         """Initialize the duplicate detector"""
         self.snowflake = SnowflakeConnector()
         self.setup_chromaprint()
+        self.max_workers = max_workers
+        self.stats_lock = Lock()
+        self.comparison_lock = Lock()  # Lock for thread-safe fingerprint comparison
+        self.stats = {
+            'comparisons': 0,
+            'duplicates': 0,
+            'skipped': 0,
+            'start_time': None
+        }
         
     def setup_chromaprint(self):
-        """Set up Chromaprint library and environment (same as fingerprint processor)"""
+        """Set up Chromaprint library and environment (cross-platform)"""
         try:
-            import ctypes
-            chromaprint_lib = ctypes.CDLL('/opt/homebrew/lib/libchromaprint.dylib')
+            # Platform-specific library loading
+            chromaprint_lib = None
+            if SYSTEM == 'Darwin':  # macOS
+                lib_paths = [
+                    '/opt/homebrew/lib/libchromaprint.dylib',
+                    '/usr/local/lib/libchromaprint.dylib'
+                ]
+                for lib_path in lib_paths:
+                    if os.path.exists(lib_path):
+                        chromaprint_lib = ctypes.CDLL(lib_path)
+                        logger.info(f"✅ Loaded chromaprint library from: {lib_path}")
+                        break
+            elif SYSTEM == 'Linux':
+                lib_paths = [
+                    'libchromaprint.so.1',
+                    'libchromaprint.so',
+                    '/lib/x86_64-linux-gnu/libchromaprint.so.1',
+                    '/usr/lib/x86_64-linux-gnu/libchromaprint.so.1',
+                    '/usr/lib/libchromaprint.so.1'
+                ]
+                for lib_path in lib_paths:
+                    try:
+                        chromaprint_lib = ctypes.CDLL(lib_path)
+                        logger.info(f"✅ Loaded chromaprint library: {lib_path}")
+                        break
+                    except OSError:
+                        continue
             
-            fpcalc_path = "/opt/homebrew/bin/fpcalc"
+            if not chromaprint_lib:
+                raise RuntimeError(f"Could not find chromaprint library for {SYSTEM}")
+            
+            # Find fpcalc binary
+            fpcalc_path = shutil.which('fpcalc')
+            if not fpcalc_path:
+                if SYSTEM == 'Darwin':
+                    candidate_paths = ['/opt/homebrew/bin/fpcalc', '/usr/local/bin/fpcalc']
+                else:
+                    candidate_paths = ['/usr/bin/fpcalc', '/usr/local/bin/fpcalc']
+                
+                for path in candidate_paths:
+                    if os.path.exists(path):
+                        fpcalc_path = path
+                        break
+            
+            if not fpcalc_path:
+                raise RuntimeError(f"Could not find fpcalc binary for {SYSTEM}")
+            
             os.environ['FPCALC_COMMAND'] = fpcalc_path
             acoustid.FPCALC_COMMAND = fpcalc_path
             
-            logger.info("✅ Chromaprint setup successful")
+            logger.info(f"✅ Chromaprint setup successful on {SYSTEM} (fpcalc: {fpcalc_path})")
             return acoustid
         except Exception as e:
-            logger.error(f"❌ Chromaprint setup failed: {e}")
+            logger.error(f"❌ Chromaprint setup failed on {SYSTEM}: {e}")
             raise
     
     def ensure_duplicates_table_exists(self):
@@ -102,8 +176,8 @@ class DuplicateDetector:
             logger.error(f"❌ Failed to create duplicates table: {e}")
             raise
     
-    def load_fingerprints(self, batch_size: int = 1000) -> List[Dict]:
-        """Load fingerprints from Snowflake"""
+    def load_all_fingerprints(self) -> List[Dict]:
+        """Load ALL fingerprints from Snowflake (no limit)"""
         query = """
         SELECT 
             ASSET_ID,
@@ -117,12 +191,13 @@ class DuplicateDetector:
         WHERE PROCESSING_STATUS = 'SUCCESS'
             AND FINGERPRINT IS NOT NULL
             AND DURATION > 0
-        ORDER BY DURATION
-        LIMIT %(batch_size)s
+        ORDER BY DURATION, SOURCE, ASSET_ID
         """
         
         try:
-            cursor = self.snowflake.execute_query(query, {'batch_size': batch_size})
+            logger.info("📥 Loading ALL fingerprints from Snowflake (this may take a minute)...")
+            start_time = time.time()
+            cursor = self.snowflake.execute_query(query)
             
             fingerprints = []
             for row in cursor:
@@ -137,12 +212,48 @@ class DuplicateDetector:
                 })
             
             cursor.close()
-            logger.info(f"📊 Loaded {len(fingerprints)} fingerprints from Snowflake")
+            load_time = time.time() - start_time
+            
+            # Count by source
+            source_counts = defaultdict(int)
+            for fp in fingerprints:
+                source_counts[fp['source']] += 1
+            
+            logger.info(f"✅ Loaded {len(fingerprints):,} fingerprints in {load_time:.1f}s")
+            for source, count in sorted(source_counts.items()):
+                logger.info(f"   {source}: {count:,} fingerprints")
+            
             return fingerprints
             
         except Exception as e:
             logger.error(f"❌ Failed to load fingerprints: {e}")
             raise
+    
+    def check_if_duplicate_exists(self, asset_id_1: str, file_key_1: str, 
+                                  asset_id_2: str, file_key_2: str) -> bool:
+        """Check if this duplicate pair already exists in the database"""
+        query = """
+        SELECT COUNT(*) 
+        FROM AI_DATA.AUDIO_DETECTED_DUPLICATES
+        WHERE (
+            (ASSET_ID_1 = %(aid1)s AND FILE_KEY_1 = %(fk1)s AND 
+             ASSET_ID_2 = %(aid2)s AND FILE_KEY_2 = %(fk2)s)
+            OR
+            (ASSET_ID_1 = %(aid2)s AND FILE_KEY_1 = %(fk2)s AND 
+             ASSET_ID_2 = %(aid1)s AND FILE_KEY_2 = %(fk1)s)
+        )
+        """
+        try:
+            cursor = self.snowflake.execute_query(query, {
+                'aid1': asset_id_1, 'fk1': file_key_1,
+                'aid2': asset_id_2, 'fk2': file_key_2
+            })
+            count = cursor.fetchone()[0]
+            cursor.close()
+            return count > 0
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to check duplicate existence: {e}")
+            return False
     
     def cluster_by_duration(self, songs: List[Dict], tolerance: float = 5.0) -> List[List[Dict]]:
         """Cluster songs by duration with tolerance"""
@@ -181,6 +292,40 @@ class DuplicateDetector:
         
         return clusters
     
+    def filter_cluster_by_mode(self, cluster: List[Dict], mode: str) -> List[Tuple[Dict, Dict]]:
+        """
+        Filter cluster to generate comparison pairs based on mode.
+        
+        Args:
+            cluster: List of songs in the same duration cluster
+            mode: 'cross-source', 'same-source', or 'all'
+        
+        Returns:
+            List of (song1, song2) tuples to compare
+        """
+        pairs = []
+        
+        for i in range(len(cluster)):
+            for j in range(i + 1, len(cluster)):
+                song1, song2 = cluster[i], cluster[j]
+                
+                # Skip if same file
+                if song1['file_key'] == song2['file_key']:
+                    continue
+                
+                # Filter by mode
+                same_source = song1['source'] == song2['source']
+                
+                if mode == 'cross-source' and same_source:
+                    continue
+                elif mode == 'same-source' and not same_source:
+                    continue
+                # 'all' mode: include everything
+                
+                pairs.append((song1, song2))
+        
+        return pairs
+    
     def classify_duplicate_type(self, song1: Dict, song2: Dict, similarity: float) -> str:
         """Classify the type of duplicate based on similarity"""
         same_format = song1['format'] == song2['format']
@@ -204,16 +349,20 @@ class DuplicateDetector:
             return "LOW_SIMILARITY"
     
     def compare_fingerprints(self, song1: Dict, song2: Dict) -> Optional[float]:
-        """Compare two fingerprints and return similarity score"""
+        """Compare two fingerprints and return similarity score (thread-safe)"""
         try:
             # Convert string fingerprints to bytes (required by acoustid.compare_fingerprints)
             fp1_bytes = song1['fingerprint'].encode('utf-8')
             fp2_bytes = song2['fingerprint'].encode('utf-8')
             
-            similarity = acoustid.compare_fingerprints(
-                (song1['duration'], fp1_bytes),
-                (song2['duration'], fp2_bytes)
-            )
+            # CRITICAL: acoustid/chromaprint is NOT thread-safe!
+            # Must serialize all comparisons with a lock
+            with self.comparison_lock:
+                similarity = acoustid.compare_fingerprints(
+                    (song1['duration'], fp1_bytes),
+                    (song2['duration'], fp2_bytes)
+                )
+            
             return float(similarity)
         except Exception as e:
             logger.warning(f"⚠️  Fingerprint comparison failed: {e}")
@@ -252,94 +401,198 @@ class DuplicateDetector:
         except Exception as e:
             logger.error(f"❌ Failed to store duplicate: {e}")
     
-    def find_duplicates_in_cluster(self, cluster: List[Dict], similarity_threshold: float = 0.80) -> List[Dict]:
-        """Find duplicates within a single duration cluster"""
-        duplicates = []
+    def compare_and_store_pair(self, pair: Tuple[Dict, Dict], similarity_threshold: float = 0.0) -> Optional[Dict]:
+        """
+        Compare a single pair of songs and store if they're similar.
         
-        for i in range(len(cluster)):
-            for j in range(i + 1, len(cluster)):
-                song1, song2 = cluster[i], cluster[j]
-                
-                # Skip if comparing the same file key (same exact file)
-                if song1['file_key'] == song2['file_key']:
-                    continue
-                
-                # Compare fingerprints
-                similarity = self.compare_fingerprints(song1, song2)
-                
-                if similarity is not None and similarity >= similarity_threshold:
-                    duplicate_type = self.classify_duplicate_type(song1, song2, similarity)
-                    
-                    duplicate = {
-                        'song1': song1,
-                        'song2': song2,
-                        'similarity': similarity,
-                        'type': duplicate_type
-                    }
-                    duplicates.append(duplicate)
-                    
-                    # Store in database
-                    self.store_duplicate(song1, song2, similarity, duplicate_type)
-                    
-                    logger.info(f"🔍 Duplicate found: {song1['asset_id']} ({song1['format']}) <-> {song2['asset_id']} ({song2['format']}) "
-                              f"({similarity:.3f}, {duplicate_type})")
+        Args:
+            pair: (song1, song2) tuple
+            similarity_threshold: Minimum similarity to store (0.0 = store all)
         
-        return duplicates
+        Returns:
+            Duplicate dict if found, None otherwise
+        """
+        song1, song2 = pair
+        
+        try:
+            # Check if already processed
+            if self.check_if_duplicate_exists(song1['asset_id'], song1['file_key'], 
+                                             song2['asset_id'], song2['file_key']):
+                with self.stats_lock:
+                    self.stats['skipped'] += 1
+                return None
+            
+            # Compare fingerprints
+            similarity = self.compare_fingerprints(song1, song2)
+            
+            # Update comparison count
+            with self.stats_lock:
+                self.stats['comparisons'] += 1
+            
+            if similarity is not None and similarity >= similarity_threshold:
+                duplicate_type = self.classify_duplicate_type(song1, song2, similarity)
+                
+                # Store in database
+                self.store_duplicate(song1, song2, similarity, duplicate_type)
+                
+                with self.stats_lock:
+                    self.stats['duplicates'] += 1
+                
+                logger.info(f"🔍 Duplicate: {song1['asset_id']} ({song1['source']}/{song1['format']}) <-> "
+                          f"{song2['asset_id']} ({song2['source']}/{song2['format']}) | "
+                          f"Similarity: {similarity:.3f} | {duplicate_type}")
+                
+                return {
+                    'song1': song1,
+                    'song2': song2,
+                    'similarity': similarity,
+                    'type': duplicate_type
+                }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to compare pair: {e}")
+            return None
     
-    def detect_duplicates(self, batch_size: int = 1000, similarity_threshold: float = 0.80, 
+    def find_duplicates_in_cluster_parallel(self, cluster: List[Dict], mode: str, 
+                                           similarity_threshold: float = 0.0) -> int:
+        """
+        Find duplicates within a single duration cluster using parallel processing.
+        
+        Args:
+            cluster: List of songs in the same duration cluster
+            mode: 'cross-source', 'same-source', or 'all'
+            similarity_threshold: Minimum similarity to store (0.0 = store all)
+        
+        Returns:
+            Number of duplicates found
+        """
+        # Generate pairs based on mode
+        pairs = self.filter_cluster_by_mode(cluster, mode)
+        
+        if not pairs:
+            return 0
+        
+        duplicates_found = 0
+        
+        # Process pairs in parallel
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [executor.submit(self.compare_and_store_pair, pair, similarity_threshold) 
+                      for pair in pairs]
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result is not None:
+                        duplicates_found += 1
+                except Exception as e:
+                    logger.error(f"❌ Pair comparison failed: {e}")
+        
+        return duplicates_found
+    
+    def detect_duplicates(self, mode: str = 'cross-source', 
+                         similarity_threshold: float = 0.0,
                          duration_tolerance: float = 5.0) -> Dict:
-        """Main duplicate detection process"""
-        logger.info(f"🚀 Starting duplicate detection (batch_size: {batch_size}, "
-                   f"similarity_threshold: {similarity_threshold}, duration_tolerance: {duration_tolerance}s)")
+        """
+        Main duplicate detection process with parallel processing.
+        
+        Args:
+            mode: 'cross-source' (artlist ↔ motionarray), 'same-source', or 'all'
+            similarity_threshold: Minimum similarity to store (0.0 = store all for later analysis)
+            duration_tolerance: Duration clustering tolerance in seconds
+        
+        Returns:
+            Dict with processing statistics
+        """
+        logger.info(f"🚀 Starting duplicate detection")
+        logger.info(f"   Mode: {mode}")
+        logger.info(f"   Similarity threshold: {similarity_threshold} (0.0 = store all)")
+        logger.info(f"   Duration tolerance: ±{duration_tolerance}s")
+        logger.info(f"   Parallel workers: {self.max_workers}")
         
         start_time = time.time()
+        
+        # Initialize stats
+        with self.stats_lock:
+            self.stats = {
+                'comparisons': 0,
+                'duplicates': 0,
+                'skipped': 0,
+                'start_time': start_time
+            }
         
         # Ensure tables exist
         self.ensure_duplicates_table_exists()
         
-        # Load fingerprints
-        songs = self.load_fingerprints(batch_size)
+        # Load ALL fingerprints
+        songs = self.load_all_fingerprints()
         
         if len(songs) < 2:
             logger.warning("⚠️  Not enough songs to compare")
-            return {'duplicates': 0, 'comparisons': 0, 'clusters': 0}
+            return {'duplicates': 0, 'comparisons': 0, 'clusters': 0, 'songs': 0}
         
         # Cluster by duration
+        logger.info(f"🔄 Clustering {len(songs):,} songs by duration (±{duration_tolerance}s)...")
         clusters = self.cluster_by_duration(songs, duration_tolerance)
         
         if not clusters:
             logger.warning("⚠️  No duration clusters found")
-            return {'duplicates': 0, 'comparisons': 0, 'clusters': 0}
+            return {'duplicates': 0, 'comparisons': 0, 'clusters': 0, 'songs': len(songs)}
         
-        # Find duplicates in each cluster
-        total_duplicates = 0
-        total_comparisons = 0
+        # Count expected comparisons
+        total_expected_pairs = 0
+        for cluster in clusters:
+            pairs = self.filter_cluster_by_mode(cluster, mode)
+            total_expected_pairs += len(pairs)
         
-        for i, cluster in enumerate(clusters):
-            logger.info(f"🔍 Processing cluster {i+1}/{len(clusters)} ({len(cluster)} songs, "
-                       f"duration: {cluster[0]['duration']:.1f}s ± {duration_tolerance}s)")
+        logger.info(f"📊 Will process {len(clusters):,} clusters with {total_expected_pairs:,} comparisons")
+        
+        # Process each cluster
+        for i, cluster in enumerate(clusters, 1):
+            cluster_pairs = self.filter_cluster_by_mode(cluster, mode)
             
-            cluster_duplicates = self.find_duplicates_in_cluster(cluster, similarity_threshold)
-            total_duplicates += len(cluster_duplicates)
+            if not cluster_pairs:
+                continue
             
-            # Calculate comparisons for this cluster
-            cluster_comparisons = len(cluster) * (len(cluster) - 1) // 2
-            total_comparisons += cluster_comparisons
+            logger.info(f"🔍 Cluster {i}/{len(clusters)} | Duration: {cluster[0]['duration']:.1f}s | "
+                       f"Songs: {len(cluster)} | Pairs to compare: {len(cluster_pairs):,}")
+            
+            # Process cluster in parallel
+            self.find_duplicates_in_cluster_parallel(cluster, mode, similarity_threshold)
+            
+            # Progress update
+            if i % 100 == 0 or i == len(clusters):
+                with self.stats_lock:
+                    elapsed = time.time() - self.stats['start_time']
+                    rate = self.stats['comparisons'] / elapsed if elapsed > 0 else 0
+                    
+                    logger.info(f"📈 Progress: {i}/{len(clusters)} clusters | "
+                              f"Comparisons: {self.stats['comparisons']:,}/{total_expected_pairs:,} | "
+                              f"Duplicates: {self.stats['duplicates']:,} | "
+                              f"Rate: {rate:.0f} comp/sec | "
+                              f"Elapsed: {elapsed/60:.1f}min")
         
-        elapsed_time = time.time() - start_time
+        # Final results
+        with self.stats_lock:
+            elapsed_time = time.time() - self.stats['start_time']
+            results = {
+                'duplicates': self.stats['duplicates'],
+                'comparisons': self.stats['comparisons'],
+                'skipped': self.stats['skipped'],
+                'clusters': len(clusters),
+                'songs': len(songs),
+                'time': elapsed_time,
+                'rate': self.stats['comparisons'] / elapsed_time if elapsed_time > 0 else 0
+            }
         
         logger.info(f"✅ Duplicate detection complete!")
-        logger.info(f"📊 Found {total_duplicates} duplicate pairs")
-        logger.info(f"📊 Made {total_comparisons:,} comparisons (vs {len(songs)*(len(songs)-1)//2:,} brute force)")
-        logger.info(f"📊 Processed {len(clusters)} clusters in {elapsed_time:.1f}s")
+        logger.info(f"📊 Found {results['duplicates']:,} duplicate pairs")
+        logger.info(f"📊 Made {results['comparisons']:,} comparisons (skipped {results['skipped']:,} existing)")
+        logger.info(f"📊 Processed {results['clusters']:,} clusters in {elapsed_time/60:.1f} minutes")
+        logger.info(f"📊 Rate: {results['rate']:.0f} comparisons/second")
         
-        return {
-            'duplicates': total_duplicates,
-            'comparisons': total_comparisons,
-            'clusters': len(clusters),
-            'songs': len(songs),
-            'time': elapsed_time
-        }
+        return results
     
     def get_stats(self) -> Dict:
         """Get statistics from the duplicates table"""
@@ -430,41 +683,75 @@ class DuplicateDetector:
             self.snowflake.close()
 
 def main():
-    parser = argparse.ArgumentParser(description='Smart Audio Duplicate Detector')
-    parser.add_argument('--batch-size', type=int, default=1000,
-                       help='Number of songs to process (default: 1000)')
-    parser.add_argument('--similarity-threshold', type=float, default=0.80,
-                       help='Minimum similarity threshold (default: 0.80)')
+    parser = argparse.ArgumentParser(
+        description='Smart Audio Duplicate Detector - UPGRADED VERSION',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Cross-source comparisons (PRIORITY - artlist ↔ motionarray)
+  python duplicate_detector.py --mode cross-source --workers 8
+
+  # Same-source comparisons (artlist ↔ artlist, motionarray ↔ motionarray)
+  python duplicate_detector.py --mode same-source --workers 8
+
+  # All comparisons
+  python duplicate_detector.py --mode all --workers 8
+
+  # Show statistics
+  python duplicate_detector.py --stats
+        """
+    )
+    parser.add_argument('--mode', choices=['cross-source', 'same-source', 'all'], 
+                       default='cross-source',
+                       help='Comparison mode (default: cross-source)')
+    parser.add_argument('--similarity-threshold', type=float, default=0.0,
+                       help='Minimum similarity to store (default: 0.0 = store all for analysis)')
     parser.add_argument('--duration-tolerance', type=float, default=5.0,
                        help='Duration clustering tolerance in seconds (default: 5.0)')
+    parser.add_argument('--workers', type=int, default=4,
+                       help='Number of parallel workers (default: 4)')
     parser.add_argument('--stats', action='store_true',
                        help='Show statistics only')
     
     args = parser.parse_args()
     
-    detector = DuplicateDetector()
+    # Validate arguments
+    if not args.stats and not args.mode:
+        parser.error("Must specify --mode or --stats")
+    
+    detector = DuplicateDetector(max_workers=args.workers)
     
     try:
         if args.stats:
             detector.print_stats()
         else:
+            logger.info("="*80)
+            logger.info(f"DUPLICATE DETECTOR - {args.mode.upper()} MODE")
+            logger.info("="*80)
+            
             results = detector.detect_duplicates(
-                batch_size=args.batch_size,
+                mode=args.mode,
                 similarity_threshold=args.similarity_threshold,
                 duration_tolerance=args.duration_tolerance
             )
             
-            print(f"\n📊 Final Results:")
-            print(f"   Duplicate pairs found: {results['duplicates']}")
+            print("\n" + "="*80)
+            print("📊 FINAL RESULTS")
+            print("="*80)
+            print(f"   Mode: {args.mode}")
+            print(f"   Duplicate pairs found: {results['duplicates']:,}")
             print(f"   Comparisons made: {results['comparisons']:,}")
-            print(f"   Duration clusters: {results['clusters']}")
-            print(f"   Songs processed: {results['songs']}")
-            print(f"   Processing time: {results['time']:.1f}s")
+            print(f"   Skipped (already processed): {results['skipped']:,}")
+            print(f"   Duration clusters: {results['clusters']:,}")
+            print(f"   Songs processed: {results['songs']:,}")
+            print(f"   Processing time: {results['time']/60:.1f} minutes")
+            print(f"   Comparison rate: {results['rate']:.0f} comparisons/second")
             
             if results['songs'] > 1:
                 brute_force_comparisons = results['songs'] * (results['songs'] - 1) // 2
-                efficiency = (1 - results['comparisons'] / brute_force_comparisons) * 100
-                print(f"   Efficiency gain: {efficiency:.1f}% fewer comparisons")
+                efficiency = (1 - results['comparisons'] / brute_force_comparisons) * 100 if brute_force_comparisons > 0 else 0
+                print(f"   Efficiency gain: {efficiency:.1f}% fewer comparisons than brute force")
+            print("="*80)
     
     finally:
         detector.close()
