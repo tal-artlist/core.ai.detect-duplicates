@@ -421,10 +421,11 @@ class AudioFingerprintProcessor:
             return None
     
     def download_audio_file(self, file_key: str, source: str, temp_dir: Path) -> Optional[Path]:
-        """Download audio file using Artlist/MotionArray API"""
+        """Download audio file using Artlist/MotionArray API with enhanced validation"""
         try:
             download_url = self.get_download_url_from_api(file_key, source)
             if not download_url:
+                logger.warning(f"❌ No download URL obtained for {file_key}")
                 return None
             
             filename = Path(file_key).name
@@ -437,35 +438,102 @@ class AudioFingerprintProcessor:
             response = requests.get(download_url, stream=True, timeout=60)
             response.raise_for_status()
             
+            # Check content type if available
+            content_type = response.headers.get('content-type', '').lower()
+            if content_type and not any(audio_type in content_type for audio_type in ['audio', 'mpeg', 'wav', 'flac']):
+                logger.warning(f"⚠️  Unexpected content type for {file_key}: {content_type}")
+            
             with open(temp_file, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
             
-            if temp_file.exists() and temp_file.stat().st_size > 0:
-                return temp_file
-            else:
+            # Enhanced file validation
+            if not temp_file.exists():
+                logger.warning(f"❌ Downloaded file does not exist: {file_key}")
                 return None
+            
+            file_size = temp_file.stat().st_size
+            
+            # Check for minimum file size (1KB for audio files)
+            if file_size == 0:
+                logger.warning(f"❌ Downloaded file is empty: {file_key}")
+                return None
+            elif file_size < 1024:  # Less than 1KB
+                logger.warning(f"❌ Downloaded file too small ({file_size} bytes): {file_key} - likely error response")
+                # Let's check the content to see if it's an error message
+                try:
+                    with open(temp_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read(500)  # Read first 500 chars
+                    if any(error_indicator in content.lower() for error_indicator in 
+                           ['error', 'not found', 'access denied', 'forbidden', 'unauthorized', 'invalid']):
+                        logger.warning(f"❌ File contains error message: {content[:200]}")
+                except:
+                    pass  # If we can't read as text, it might be binary but still too small
+                return None
+            elif file_size < 10240:  # Less than 10KB - suspicious for audio files
+                logger.warning(f"⚠️  Downloaded file suspiciously small ({file_size} bytes): {file_key}")
+            
+            return temp_file
                 
         except Exception as e:
             logger.warning(f"❌ Download error: {file_key} - {e}")
             return None
     
     def generate_fingerprint(self, file_path: Path) -> Optional[Tuple[float, str]]:
-        """Generate fingerprint with robust error handling"""
+        """Generate fingerprint with robust error handling and validation"""
         try:
+            # Pre-validation: Check file size again before processing
+            file_size = file_path.stat().st_size
+            if file_size < 1024:
+                logger.warning(f"❌ File too small for fingerprinting ({file_size} bytes): {file_path.name}")
+                return None
+            
+            # Attempt fingerprint generation
             duration, fingerprint = self.acoustid.fingerprint_file(str(file_path))
             
+            # Validate results
+            if duration is None or duration <= 0:
+                logger.warning(f"❌ Invalid duration ({duration}): {file_path.name}")
+                return None
+            
+            if fingerprint is None:
+                logger.warning(f"❌ No fingerprint generated: {file_path.name}")
+                return None
+            
+            # Convert fingerprint to string if needed
             if isinstance(fingerprint, bytes):
                 fingerprint = fingerprint.decode('utf-8')
             
-            if duration > 0 and fingerprint:
-                return float(duration), fingerprint
-            else:
+            # Validate fingerprint content
+            if not fingerprint or len(fingerprint) < 10:
+                logger.warning(f"❌ Fingerprint too short ({len(fingerprint)} chars): {file_path.name}")
                 return None
+            
+            # Additional validation: duration should be reasonable for audio files
+            if duration < 1.0:
+                logger.warning(f"⚠️  Very short audio duration ({duration}s): {file_path.name}")
+            elif duration > 3600:  # More than 1 hour
+                logger.warning(f"⚠️  Very long audio duration ({duration}s): {file_path.name}")
+            
+            logger.debug(f"✅ Generated fingerprint: {file_path.name} - {duration}s, {len(fingerprint)} chars")
+            return float(duration), fingerprint
                 
         except Exception as e:
-            logger.warning(f"❌ Fingerprint error: {file_path.name} - {e}")
+            error_msg = str(e)
+            
+            # Provide more specific error messages based on the exception
+            if "could not be decoded" in error_msg.lower():
+                logger.warning(f"❌ Audio decoding failed: {file_path.name} - file may be corrupted or in unsupported format")
+            elif "no such file" in error_msg.lower():
+                logger.warning(f"❌ File not found during fingerprinting: {file_path.name}")
+            elif "permission denied" in error_msg.lower():
+                logger.warning(f"❌ Permission denied accessing file: {file_path.name}")
+            elif "timeout" in error_msg.lower():
+                logger.warning(f"❌ Timeout during fingerprinting: {file_path.name}")
+            else:
+                logger.warning(f"❌ Fingerprint error: {file_path.name} - {error_msg}")
+            
             return None
     
     def delete_existing_record(self, asset_id: str, file_key: str):
@@ -544,7 +612,7 @@ class AudioFingerprintProcessor:
             logger.error(f"❌ Failed to store error: {asset_id} - {e}")
     
     def process_single_asset(self, asset_data: Dict, is_retry: bool = False) -> bool:
-        """Process a single asset (thread-safe version)"""
+        """Process a single asset (thread-safe version) with enhanced error handling"""
         asset_id = asset_data['ASSET_ID']
         file_key = asset_data['FILE_KEY']
         file_format = asset_data.get('FILE_FORMAT', 'mp3')
@@ -562,19 +630,28 @@ class AudioFingerprintProcessor:
             # Download file
             temp_file = self.download_audio_file(file_key, source, temp_dir)
             if not temp_file:
-                self.store_error(asset_id, file_key, file_format, file_size, source, "Download failed", is_retry)
+                error_msg = "Download failed - file not available or returned error response"
+                self.store_error(asset_id, file_key, file_format, file_size, source, error_msg, is_retry)
+                return False
+            
+            # Check if downloaded file is valid
+            actual_file_size = temp_file.stat().st_size
+            if actual_file_size < 1024:
+                error_msg = f"Downloaded file too small ({actual_file_size} bytes) - likely API error response"
+                self.store_error(asset_id, file_key, file_format, file_size, source, error_msg, is_retry)
                 return False
             
             # Generate fingerprint
             result = self.generate_fingerprint(temp_file)
             if not result:
-                self.store_error(asset_id, file_key, file_format, file_size, source, "Fingerprint generation failed", is_retry)
+                error_msg = "Fingerprint generation failed - audio could not be decoded or file corrupted"
+                self.store_error(asset_id, file_key, file_format, file_size, source, error_msg, is_retry)
                 return False
             
             duration, fingerprint = result
             
             # Store in Snowflake
-            self.store_fingerprint(asset_id, file_key, file_format, duration, fingerprint, file_size, source, is_retry)
+            self.store_fingerprint(asset_id, file_key, file_format, duration, fingerprint, actual_file_size, source, is_retry)
             
             # Clean up temp file
             temp_file.unlink()
@@ -584,13 +661,14 @@ class AudioFingerprintProcessor:
                 self.stats['successful'] += 1
                 self.stats['processed'] += 1
             processing_time = time.time() - start_time
-            logger.info(f"✅ [{thread_name}] {retry_msg}Completed: {asset_id} ({processing_time:.1f}s processing, {duration:.1f}s audio)")
+            logger.info(f"✅ [{thread_name}] {retry_msg}Completed: {asset_id} ({processing_time:.1f}s processing, {duration:.1f}s audio, {actual_file_size:,} bytes)")
             return True
             
         except Exception as e:
+            error_msg = f"Processing exception: {str(e)}"
             logger.error(f"❌ [{thread_name}] {retry_msg}Processing failed: {asset_id} - {e}")
             
-            self.store_error(asset_id, file_key, file_format, file_size, source, str(e), is_retry)
+            self.store_error(asset_id, file_key, file_format, file_size, source, error_msg, is_retry)
             
             # Update stats (thread-safe)
             with self.stats_lock:
@@ -751,7 +829,8 @@ def main():
         print(f"   Processed: {results['processed']}")
         print(f"   Successful: {results['successful']}")
         print(f"   Failed: {results['failed']}")
-        print(f"   Success Rate: {results['successful']/results['processed']*100:.1f}%")
+        success_rate = (results['successful']/results['processed']*100) if results['processed'] > 0 else 0.0
+        print(f"   Success Rate: {success_rate:.1f}%")
         print(f"   Total Time: {results['total_time_minutes']:.1f} minutes")
         print(f"   Processing Rate: {results['rate_per_second']:.1f} assets/second")
         print(f"   Parallel Workers: {args.workers}")
