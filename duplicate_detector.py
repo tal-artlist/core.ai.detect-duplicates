@@ -72,11 +72,12 @@ logger = logging.getLogger(__name__)
 class DuplicateDetector:
     """Smart duplicate detector using duration-based clustering with parallel processing"""
     
-    def __init__(self, max_workers: int = 4):
+    def __init__(self, max_workers: int = 4, batch_size: int = 100):
         """Initialize the duplicate detector"""
         self.snowflake = SnowflakeConnector()
         self.setup_chromaprint()
         self.max_workers = max_workers
+        self.batch_size = batch_size
         self.stats_lock = Lock()
         self.comparison_lock = Lock()  # Lock for thread-safe fingerprint comparison
         self.stats = {
@@ -85,6 +86,9 @@ class DuplicateDetector:
             'skipped': 0,
             'start_time': None
         }
+        # Batch buffer for bulk INSERT (thread-safe)
+        self.batch_lock = Lock()
+        self.duplicate_batch = []
         
     def setup_chromaprint(self):
         """Set up Chromaprint library and environment (cross-platform)"""
@@ -368,38 +372,92 @@ class DuplicateDetector:
             logger.warning(f"⚠️  Fingerprint comparison failed: {e}")
             return None
     
-    def store_duplicate(self, song1: Dict, song2: Dict, similarity: float, duplicate_type: str):
-        """Store duplicate pair in Snowflake"""
+    def flush_duplicate_batch(self):
+        """Flush duplicate batch to Snowflake using bulk INSERT (thread-safe)"""
+        with self.batch_lock:
+            if not self.duplicate_batch:
+                return
+            
+            batch = self.duplicate_batch.copy()
+            self.duplicate_batch.clear()
+        
+        if not batch:
+            return
+        
+        # Build multi-row INSERT statement
         insert_sql = """
         INSERT INTO AI_DATA.AUDIO_DETECTED_DUPLICATES 
         (ASSET_ID_1, ASSET_ID_2, IS_SAME_ASSET, SIMILARITY, DUPLICATE_TYPE,
          FILE_KEY_1, FORMAT_1, SOURCE_1, DURATION_1,
          FILE_KEY_2, FORMAT_2, SOURCE_2, DURATION_2, DURATION_DIFF)
-        VALUES (%(asset_id_1)s, %(asset_id_2)s, %(is_same_asset)s, %(similarity)s, %(duplicate_type)s,
-                %(file_key_1)s, %(format_1)s, %(source_1)s, %(duration_1)s,
-                %(file_key_2)s, %(format_2)s, %(source_2)s, %(duration_2)s, %(duration_diff)s)
+        VALUES 
         """
         
+        # Add value placeholders for each record
+        value_rows = []
+        params = {}
+        for i, record in enumerate(batch):
+            value_rows.append(
+                f"(%(asset_id_1_{i})s, %(asset_id_2_{i})s, %(is_same_asset_{i})s, %(similarity_{i})s, %(duplicate_type_{i})s, "
+                f"%(file_key_1_{i})s, %(format_1_{i})s, %(source_1_{i})s, %(duration_1_{i})s, "
+                f"%(file_key_2_{i})s, %(format_2_{i})s, %(source_2_{i})s, %(duration_2_{i})s, %(duration_diff_{i})s)"
+            )
+            params[f'asset_id_1_{i}'] = record['asset_id_1']
+            params[f'asset_id_2_{i}'] = record['asset_id_2']
+            params[f'is_same_asset_{i}'] = record['is_same_asset']
+            params[f'similarity_{i}'] = record['similarity']
+            params[f'duplicate_type_{i}'] = record['duplicate_type']
+            params[f'file_key_1_{i}'] = record['file_key_1']
+            params[f'format_1_{i}'] = record['format_1']
+            params[f'source_1_{i}'] = record['source_1']
+            params[f'duration_1_{i}'] = record['duration_1']
+            params[f'file_key_2_{i}'] = record['file_key_2']
+            params[f'format_2_{i}'] = record['format_2']
+            params[f'source_2_{i}'] = record['source_2']
+            params[f'duration_2_{i}'] = record['duration_2']
+            params[f'duration_diff_{i}'] = record['duration_diff']
+        
+        insert_sql += ',\n'.join(value_rows)
+        
         try:
-            self.snowflake.execute_query(insert_sql, {
-                'asset_id_1': song1['asset_id'],
-                'asset_id_2': song2['asset_id'],
-                'is_same_asset': song1['asset_id'] == song2['asset_id'],
-                'similarity': similarity,
-                'duplicate_type': duplicate_type,
-                'file_key_1': song1['file_key'],
-                'format_1': song1['format'],
-                'source_1': song1['source'],
-                'duration_1': song1['duration'],
-                'file_key_2': song2['file_key'],
-                'format_2': song2['format'],
-                'source_2': song2['source'],
-                'duration_2': song2['duration'],
-                'duration_diff': abs(song1['duration'] - song2['duration'])
-            })
-            logger.debug(f"✅ Stored duplicate: {song1['asset_id']} <-> {song2['asset_id']} ({similarity:.3f})")
+            cursor = self.snowflake.execute_query(insert_sql, params)
+            cursor.close()
+            logger.info(f"💾 Flushed {len(batch)} duplicate pairs to database")
         except Exception as e:
-            logger.error(f"❌ Failed to store duplicate: {e}")
+            logger.error(f"❌ Failed to flush duplicate batch: {e}")
+            raise
+    
+    def store_duplicate(self, song1: Dict, song2: Dict, similarity: float, duplicate_type: str):
+        """Store duplicate pair in batch buffer (thread-safe, bulk INSERT)"""
+        # Add to batch buffer
+        record = {
+            'asset_id_1': song1['asset_id'],
+            'asset_id_2': song2['asset_id'],
+            'is_same_asset': song1['asset_id'] == song2['asset_id'],
+            'similarity': similarity,
+            'duplicate_type': duplicate_type,
+            'file_key_1': song1['file_key'],
+            'format_1': song1['format'],
+            'source_1': song1['source'],
+            'duration_1': song1['duration'],
+            'file_key_2': song2['file_key'],
+            'format_2': song2['format'],
+            'source_2': song2['source'],
+            'duration_2': song2['duration'],
+            'duration_diff': abs(song1['duration'] - song2['duration'])
+        }
+        
+        should_flush = False
+        with self.batch_lock:
+            self.duplicate_batch.append(record)
+            if len(self.duplicate_batch) >= self.batch_size:
+                should_flush = True
+        
+        # Flush if batch is full (outside lock to avoid blocking other threads)
+        if should_flush:
+            self.flush_duplicate_batch()
+        
+        logger.debug(f"✅ Queued duplicate: {song1['asset_id']} <-> {song2['asset_id']} ({similarity:.3f})")
     
     def compare_and_store_pair(self, pair: Tuple[Dict, Dict], similarity_threshold: float = 0.0) -> Optional[Dict]:
         """
@@ -573,6 +631,10 @@ class DuplicateDetector:
                               f"Rate: {rate:.0f} comp/sec | "
                               f"Elapsed: {elapsed/60:.1f}min")
         
+        # CRITICAL: Flush any remaining batches to database
+        logger.info("📦 Flushing remaining batches to database...")
+        self.flush_duplicate_batch()
+        
         # Final results
         with self.stats_lock:
             elapsed_time = time.time() - self.stats['start_time']
@@ -710,6 +772,8 @@ Examples:
                        help='Duration clustering tolerance in seconds (default: 5.0)')
     parser.add_argument('--workers', type=int, default=4,
                        help='Number of parallel workers (default: 4)')
+    parser.add_argument('--batch-size', type=int, default=100,
+                       help='Batch size for bulk INSERT operations (default: 100)')
     parser.add_argument('--stats', action='store_true',
                        help='Show statistics only')
     
@@ -719,7 +783,8 @@ Examples:
     if not args.stats and not args.mode:
         parser.error("Must specify --mode or --stats")
     
-    detector = DuplicateDetector(max_workers=args.workers)
+    detector = DuplicateDetector(max_workers=args.workers, batch_size=args.batch_size)
+    logger.info(f"💾 Using batch size: {args.batch_size} (bulk INSERT mode)")
     
     try:
         if args.stats:
