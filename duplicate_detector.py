@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Smart Audio Duplicate Detector - UPGRADED VERSION
+Smart Audio Duplicate Detector - MULTIPROCESSING OPTIMIZED 🚀
 
 Loads ALL fingerprints from Snowflake and uses duration-based clustering 
-with parallel processing to efficiently find duplicates.
+with TRUE PARALLEL PROCESSING (ProcessPoolExecutor) to efficiently find duplicates.
 
 🎯 DEFAULT BEHAVIOR: Writes results to JSONL file (fast, cost-effective)
 📤 UPLOAD MODE: Load file and upload to Snowflake in batches (--load-and-upload)
@@ -48,8 +48,18 @@ from collections import defaultdict
 import subprocess
 import time
 import platform
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from threading import Lock
+from multiprocessing import cpu_count, set_start_method, get_start_method
+import multiprocessing
+
+# Set multiprocessing start method to 'spawn' for better library compatibility
+# This MUST be done before any other multiprocessing code
+try:
+    if get_start_method(allow_none=True) is None:
+        set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
 import ctypes
 from datetime import datetime
 
@@ -85,6 +95,110 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# MULTIPROCESSING WORKER FUNCTIONS (must be at module level for pickling)
+# ============================================================================
+
+def setup_chromaprint_for_worker():
+    """Setup chromaprint for each worker process - lightweight version"""
+    # Don't try to load libraries - just use acoustid's built-in functionality
+    # The acoustid module will handle this automatically
+    return True
+
+def process_comparison_worker(work_data):
+    """
+    Worker function for multiprocessing - compares a single pair of songs.
+    Must be at module level for pickle serialization.
+    
+    Args:
+        work_data: Tuple of (song1_dict, song2_dict, pair_id)
+    
+    Returns:
+        Dict with comparison results
+    """
+    try:
+        song1, song2, pair_id = work_data
+        
+        # Skip if same file
+        if song1['file_key'] == song2['file_key']:
+            return {
+                'pair_id': pair_id,
+                'skipped': True,
+                'reason': 'same_file'
+            }
+        
+        # Convert fingerprints to bytes
+        fp1_bytes = song1['fingerprint'].encode('utf-8')
+        fp2_bytes = song2['fingerprint'].encode('utf-8')
+        
+        # Compare fingerprints (no lock needed - each process is independent!)
+        start_time = time.perf_counter()
+        similarity = acoustid.compare_fingerprints(
+            (song1['duration'], fp1_bytes),
+            (song2['duration'], fp2_bytes)
+        )
+        comp_time = time.perf_counter() - start_time
+        
+        if similarity is None:
+            return {
+                'pair_id': pair_id,
+                'success': False,
+                'error': 'comparison_returned_none'
+            }
+        
+        # Classify duplicate type
+        same_format = song1['format'] == song2['format']
+        same_source = song1['source'] == song2['source']
+        
+        if similarity >= 0.95:
+            if same_format and same_source:
+                dup_type = "IDENTICAL"
+            elif same_source:
+                dup_type = "SAME_CONTENT_DIFF_FORMAT"
+            else:
+                dup_type = "CROSS_SOURCE_IDENTICAL"
+        elif similarity >= 0.80:
+            dup_type = "HIGH_SIMILARITY_CROSS_SOURCE" if not same_source else "HIGH_SIMILARITY_SAME_SOURCE"
+        elif similarity >= 0.60:
+            dup_type = "RELATED_VERSIONS"
+        else:
+            dup_type = "LOW_SIMILARITY"
+        
+        # Build result record
+        return {
+            'pair_id': pair_id,
+            'success': True,
+            'similarity': float(similarity),
+            'duplicate_type': dup_type,
+            'comp_time': comp_time,
+            'record': {
+                'asset_id_1': song1['asset_id'],
+                'asset_id_2': song2['asset_id'],
+                'is_same_asset': song1['asset_id'] == song2['asset_id'],
+                'similarity': float(similarity),
+                'duplicate_type': dup_type,
+                'file_key_1': song1['file_key'],
+                'format_1': song1['format'],
+                'source_1': song1['source'],
+                'duration_1': song1['duration'],
+                'file_key_2': song2['file_key'],
+                'format_2': song2['format'],
+                'source_2': song2['source'],
+                'duration_2': song2['duration'],
+                'duration_diff': abs(song1['duration'] - song2['duration'])
+            }
+        }
+        
+    except Exception as e:
+        return {
+            'pair_id': pair_id,
+            'success': False,
+            'error': str(e),
+            'error_type': type(e).__name__
+        }
+
+# ============================================================================
+
 class DuplicateDetector:
     """Smart duplicate detector using duration-based clustering with parallel processing"""
     
@@ -102,7 +216,7 @@ class DuplicateDetector:
         self.batch_size = batch_size
         self.output_file = output_file
         self.stats_lock = Lock()
-        self.comparison_lock = Lock()  # Lock for thread-safe fingerprint comparison
+        # No comparison_lock needed with ProcessPoolExecutor! 🚀
         self.stats = {
             'comparisons': 0,
             'duplicates': 0,
@@ -696,7 +810,7 @@ class DuplicateDetector:
     def find_duplicates_in_cluster_parallel(self, cluster: List[Dict], mode: str, 
                                            similarity_threshold: float = 0.0) -> int:
         """
-        Find duplicates within a single duration cluster using parallel processing.
+        Find duplicates within a single duration cluster using MULTIPROCESSING (OPTIMIZED! 🚀).
         
         Args:
             cluster: List of songs in the same duration cluster
@@ -714,18 +828,100 @@ class DuplicateDetector:
         
         duplicates_found = 0
         
-        # Process pairs in parallel
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [executor.submit(self.compare_and_store_pair, pair, similarity_threshold) 
-                      for pair in pairs]
+        # Prepare work data for worker processes (song1, song2, pair_id)
+        work_items = []
+        for idx, (song1, song2) in enumerate(pairs):
+            # Check if already processed (to save on useless comparisons)
+            if self.check_if_duplicate_exists(song1['asset_id'], song1['file_key'], 
+                                             song2['asset_id'], song2['file_key']):
+                with self.stats_lock:
+                    self.stats['skipped'] += 1
+                continue
+            
+            work_items.append((song1, song2, idx))
+        
+        if not work_items:
+            return 0
+        
+        # Process pairs in parallel with MULTIPROCESSING 🚀
+        # Each process runs independently, no GIL, pure parallel CPU power!
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(process_comparison_worker, work): work[2] 
+                      for work in work_items}
             
             for future in as_completed(futures):
                 try:
                     result = future.result()
-                    if result is not None:
+                    
+                    if result.get('skipped'):
+                        with self.stats_lock:
+                            self.stats['skipped'] += 1
+                        continue
+                    
+                    if not result.get('success'):
+                        # Handle error
+                        error = result.get('error', 'unknown')
+                        work_item = work_items[result['pair_id']]
+                        song1, song2 = work_item[0], work_item[1]
+                        
+                        # Store error for retry
+                        self.store_error(song1, song2, 'COMPARISON_FAILED', error)
+                        
+                        with self.stats_lock:
+                            self.stats['errors'] += 1
+                        continue
+                    
+                    # Successful comparison
+                    similarity = result['similarity']
+                    
+                    with self.stats_lock:
+                        self.stats['comparisons'] += 1
+                        comparisons_count = self.stats['comparisons']
+                    
+                    # Progress update every 1000 comparisons
+                    if comparisons_count % 1000 == 0:
+                        with self.stats_lock:
+                            elapsed = time.time() - self.stats['start_time']
+                            rate = self.stats['comparisons'] / elapsed if elapsed > 0 else 0
+                            logger.info(f"⚡ {comparisons_count:,} comparisons | "
+                                      f"{self.stats['duplicates']:,} duplicates | "
+                                      f"{rate:.0f} comp/sec")
+                    
+                    # Check threshold and store if needed
+                    if similarity >= similarity_threshold:
+                        record = result['record']
+                        
+                        # Store duplicate
+                        if self.output_file:
+                            # Write to file
+                            with self.file_lock:
+                                self.file_buffer.append(record)
+                                if len(self.file_buffer) >= self.batch_size:
+                                    self.flush_file_buffer()
+                        else:
+                            # Store in database
+                            with self.batch_lock:
+                                self.duplicate_batch.append(record)
+                                if len(self.duplicate_batch) >= self.batch_size:
+                                    self.flush_database_batch()
+                        
+                        with self.stats_lock:
+                            self.stats['duplicates'] += 1
+                        
                         duplicates_found += 1
+                        
+                        # Log if high similarity
+                        if similarity >= 0.60:
+                            work_item = work_items[result['pair_id']]
+                            song1, song2 = work_item[0], work_item[1]
+                            logger.info(f"🔍 Duplicate: {song1['asset_id']} ({song1['source']}/{song1['format']}) <-> "
+                                      f"{song2['asset_id']} ({song2['source']}/{song2['format']}) | "
+                                      f"Similarity: {similarity:.3f} | {result['duplicate_type']}")
+                    
                 except Exception as e:
-                    logger.error(f"❌ Pair comparison failed: {e}")
+                    logger.error(f"❌ Failed to process comparison result: {e}")
+                    with self.stats_lock:
+                        self.stats['errors'] += 1
         
         return duplicates_found
     
@@ -788,13 +984,18 @@ class DuplicateDetector:
             logger.warning("⚠️  No duration clusters found")
             return {'duplicates': 0, 'comparisons': 0, 'clusters': 0, 'songs': len(songs)}
         
-        # Count expected comparisons
-        total_expected_pairs = 0
-        for cluster in clusters:
-            pairs = self.filter_cluster_by_mode(cluster, mode)
-            total_expected_pairs += len(pairs)
+        # Start processing (pair counting removed - was too slow and unnecessary)
+        logger.info(f"🚀 Processing {len(clusters):,} clusters...")
         
-        logger.info(f"📊 Will process {len(clusters):,} clusters with {total_expected_pairs:,} comparisons")
+        # Create output files immediately (so user knows they exist)
+        if self.output_file:
+            # Touch the output file
+            open(self.output_file, 'a').close()
+            logger.info(f"📝 Output file created: {self.output_file}")
+            
+            # Touch the error file
+            open(self.error_file, 'a').close()
+            logger.info(f"📝 Error tracking file: {self.error_file}")
         
         # Count clusters to skip
         clusters_to_skip = len(self.completed_clusters)
@@ -816,8 +1017,9 @@ class DuplicateDetector:
                 self.save_checkpoint(i, len(clusters))
                 continue
             
+            # Log cluster start (less verbose now that we have 1000-comparison updates)
             logger.info(f"🔍 Cluster {i}/{len(clusters)} | Duration: {cluster[0]['duration']:.1f}s | "
-                       f"Songs: {len(cluster)} | Pairs to compare: {len(cluster_pairs):,}")
+                       f"Songs: {len(cluster)} | Pairs: {len(cluster_pairs):,}")
             
             # Process cluster in parallel
             self.find_duplicates_in_cluster_parallel(cluster, mode, similarity_threshold)
@@ -828,18 +1030,38 @@ class DuplicateDetector:
             # Save checkpoint periodically
             self.save_checkpoint(i, len(clusters))
             
-            # Progress update
-            if i % 10 == 0 or i == len(clusters):
+            # Overall progress summary (every 100 clusters)
+            if i % 100 == 0 or i == len(clusters):
                 with self.stats_lock:
                     elapsed = time.time() - self.stats['start_time']
                     rate = self.stats['comparisons'] / elapsed if elapsed > 0 else 0
                     completed = len(self.completed_clusters)
                     
-                    logger.info(f"📈 Progress: {completed}/{len(clusters)} clusters ({completed/len(clusters)*100:.1f}%) | "
-                              f"Comparisons: {self.stats['comparisons']:,}/{total_expected_pairs:,} | "
+                    logger.info(f"\n" + "="*80)
+                    logger.info(f"📊 OVERALL PROGRESS: {completed}/{len(clusters)} clusters ({completed/len(clusters)*100:.1f}%)")
+                    logger.info(f"   Total Comparisons: {self.stats['comparisons']:,} | "
                               f"Duplicates: {self.stats['duplicates']:,} | "
-                              f"Rate: {rate:.0f} comp/sec | "
+                              f"Errors: {self.stats['errors']}")
+                    logger.info(f"   Average Rate: {rate:.0f} comp/sec | "
                               f"Elapsed: {elapsed/60:.1f}min")
+                    
+                    # Estimate time remaining
+                    if rate > 0 and completed < len(clusters):
+                        clusters_remaining = len(clusters) - completed
+                        # Rough estimate: assume similar comparison load per cluster
+                        avg_comparisons_per_cluster = self.stats['comparisons'] / completed if completed > 0 else 0
+                        estimated_comparisons_left = clusters_remaining * avg_comparisons_per_cluster
+                        estimated_seconds_left = estimated_comparisons_left / rate
+                        estimated_hours_left = estimated_seconds_left / 3600
+                        
+                        if estimated_hours_left >= 24:
+                            logger.info(f"   Estimated time remaining: {estimated_hours_left/24:.1f} days")
+                        elif estimated_hours_left >= 1:
+                            logger.info(f"   Estimated time remaining: {estimated_hours_left:.1f} hours")
+                        else:
+                            logger.info(f"   Estimated time remaining: {estimated_seconds_left/60:.0f} minutes")
+                    
+                    logger.info("="*80 + "\n")
         
         # Flush any remaining records
         if self.output_file:
@@ -1102,8 +1324,10 @@ Examples:
                        help='Minimum similarity to store (default: 0.0 = store all for analysis)')
     parser.add_argument('--duration-tolerance', type=float, default=5.0,
                        help='Duration clustering tolerance in seconds (default: 5.0)')
-    parser.add_argument('--workers', type=int, default=4,
-                       help='Number of parallel workers (default: 4)')
+    # Auto-detect optimal worker count (use 90% of cores, minimum 1)
+    default_workers = max(1, int(cpu_count() * 0.9))
+    parser.add_argument('--workers', type=int, default=default_workers,
+                       help=f'Number of parallel PROCESSES (default: {default_workers}, auto-detected from {cpu_count()} cores)')
     parser.add_argument('--output', '--output-file', dest='output_file',
                        help='Output file for results (JSONL format). If specified, writes to file instead of Snowflake.')
     parser.add_argument('--load-and-upload', dest='load_file',
@@ -1154,6 +1378,8 @@ Examples:
             logger.info("="*80)
             logger.info(f"DUPLICATE DETECTOR - {args.mode.upper()} MODE")
             logger.info("="*80)
+            logger.info(f"🚀 MULTIPROCESSING MODE: {args.workers} parallel processes (detected {cpu_count()} cores)")
+            logger.info(f"   Expected throughput: ~{args.workers * 6.5:.0f} comparisons/second")
             if output_file:
                 logger.info(f"📝 Output mode: FILE ({output_file})")
             else:
