@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 class AudioFingerprintProcessor:
     """Processor with parallel processing and source filtering"""
     
-    def __init__(self, max_workers: int = 4, batch_size: int = 100):
+    def __init__(self, max_workers: int = 4, batch_size: int = 10000):
         self.snowflake = SnowflakeConnector()
         self.acoustid = self.setup_chromaprint()
         self.max_workers = max_workers
@@ -64,7 +64,7 @@ class AudioFingerprintProcessor:
             'failed': 0,
             'start_time': None
         }
-        # Batch buffers for bulk INSERT (thread-safe)
+        # Batch writing buffers (thread-safe)
         self.batch_lock = Lock()
         self.fingerprint_batch = []
         self.error_batch = []
@@ -558,111 +558,74 @@ class AudioFingerprintProcessor:
             logger.warning(f"⚠️  Failed to delete existing record: {asset_id} - {e}")
     
     def flush_fingerprint_batch(self):
-        """Flush fingerprint batch to Snowflake using bulk INSERT (thread-safe)"""
+        """Flush accumulated fingerprint records to Snowflake (thread-safe)"""
         with self.batch_lock:
             if not self.fingerprint_batch:
                 return
             
-            batch = self.fingerprint_batch.copy()
+            batch_to_write = self.fingerprint_batch.copy()
             self.fingerprint_batch.clear()
         
-        if not batch:
+        if not batch_to_write:
             return
         
-        # Build multi-row INSERT statement
         insert_sql = """
         INSERT INTO AI_DATA.AUDIO_FINGERPRINT 
         (ASSET_ID, FILE_KEY, FORMAT, DURATION, FINGERPRINT, FILE_SIZE, SOURCE, PROCESSING_STATUS)
-        VALUES 
+        VALUES (%(asset_id)s, %(file_key)s, %(format)s, %(duration)s, %(fingerprint)s, %(file_size)s, %(source)s, 'SUCCESS')
         """
         
-        # Add value placeholders for each record
-        value_rows = []
-        params = {}
-        for i, record in enumerate(batch):
-            value_rows.append(
-                f"(%(asset_id_{i})s, %(file_key_{i})s, %(format_{i})s, %(duration_{i})s, "
-                f"%(fingerprint_{i})s, %(file_size_{i})s, %(source_{i})s, 'SUCCESS')"
-            )
-            params[f'asset_id_{i}'] = record['asset_id']
-            params[f'file_key_{i}'] = record['file_key']
-            params[f'format_{i}'] = record['format']
-            params[f'duration_{i}'] = record['duration']
-            params[f'fingerprint_{i}'] = record['fingerprint']
-            params[f'file_size_{i}'] = record['file_size']
-            params[f'source_{i}'] = record['source']
-        
-        insert_sql += ',\n'.join(value_rows)
-        
         try:
-            cursor = self.snowflake.execute_query(insert_sql, params)
+            logger.info(f"💾 Flushing {len(batch_to_write)} fingerprint records to Snowflake...")
+            cursor = self.snowflake.conn.cursor()
+            cursor.executemany(insert_sql, batch_to_write)
             cursor.close()
-            logger.info(f"💾 Flushed {len(batch)} fingerprints to database")
+            logger.info(f"✅ Successfully wrote {len(batch_to_write)} fingerprint records")
         except Exception as e:
             logger.error(f"❌ Failed to flush fingerprint batch: {e}")
             raise
     
     def flush_error_batch(self):
-        """Flush error batch to Snowflake using bulk INSERT (thread-safe)"""
+        """Flush accumulated error records to Snowflake (thread-safe)"""
         with self.batch_lock:
             if not self.error_batch:
                 return
             
-            batch = self.error_batch.copy()
+            batch_to_write = self.error_batch.copy()
             self.error_batch.clear()
         
-        if not batch:
+        if not batch_to_write:
             return
         
-        # Build multi-row INSERT statement
         insert_sql = """
         INSERT INTO AI_DATA.AUDIO_FINGERPRINT 
         (ASSET_ID, FILE_KEY, FORMAT, FILE_SIZE, SOURCE, PROCESSING_STATUS, ERROR_MESSAGE)
-        VALUES 
+        VALUES (%(asset_id)s, %(file_key)s, %(format)s, %(file_size)s, %(source)s, 'ERROR', %(error_message)s)
         """
         
-        # Add value placeholders for each record
-        value_rows = []
-        params = {}
-        for i, record in enumerate(batch):
-            value_rows.append(
-                f"(%(asset_id_{i})s, %(file_key_{i})s, %(format_{i})s, %(file_size_{i})s, "
-                f"%(source_{i})s, 'ERROR', %(error_message_{i})s)"
-            )
-            params[f'asset_id_{i}'] = record['asset_id']
-            params[f'file_key_{i}'] = record['file_key']
-            params[f'format_{i}'] = record['format']
-            params[f'file_size_{i}'] = record['file_size']
-            params[f'source_{i}'] = record['source']
-            params[f'error_message_{i}'] = record['error_message']
-        
-        insert_sql += ',\n'.join(value_rows)
-        
         try:
-            cursor = self.snowflake.execute_query(insert_sql, params)
+            logger.info(f"💾 Flushing {len(batch_to_write)} error records to Snowflake...")
+            cursor = self.snowflake.conn.cursor()
+            cursor.executemany(insert_sql, batch_to_write)
             cursor.close()
-            logger.info(f"💾 Flushed {len(batch)} errors to database")
+            logger.info(f"✅ Successfully wrote {len(batch_to_write)} error records")
         except Exception as e:
             logger.error(f"❌ Failed to flush error batch: {e}")
             raise
     
     def flush_all_batches(self):
-        """Flush all pending batches to database"""
-        try:
-            self.flush_fingerprint_batch()
-            self.flush_error_batch()
-        except Exception as e:
-            logger.error(f"❌ Failed to flush all batches: {e}")
+        """Flush all accumulated batches to Snowflake"""
+        self.flush_fingerprint_batch()
+        self.flush_error_batch()
     
     def store_fingerprint(self, asset_id: str, file_key: str, format_ext: str, 
                          duration: float, fingerprint: str, file_size: int, source: str,
                          is_retry: bool = False):
-        """Store fingerprint in batch buffer (thread-safe, bulk INSERT)"""
+        """Store fingerprint in batch buffer (thread-safe)"""
         # Delete old record if this is a retry
         if is_retry:
             self.delete_existing_record(asset_id, file_key)
         
-        # Add to batch buffer
         record = {
             'asset_id': asset_id,
             'file_key': file_key,
@@ -673,11 +636,10 @@ class AudioFingerprintProcessor:
             'source': source
         }
         
-        should_flush = False
+        # Add to batch buffer
         with self.batch_lock:
             self.fingerprint_batch.append(record)
-            if len(self.fingerprint_batch) >= self.batch_size:
-                should_flush = True
+            should_flush = len(self.fingerprint_batch) >= self.batch_size
         
         # Flush if batch is full (outside lock to avoid blocking other threads)
         if should_flush:
@@ -685,12 +647,11 @@ class AudioFingerprintProcessor:
     
     def store_error(self, asset_id: str, file_key: str, format_ext: str, 
                    file_size: int, source: str, error_message: str, is_retry: bool = False):
-        """Store processing error in batch buffer (thread-safe, bulk INSERT)"""
+        """Store processing error in batch buffer (thread-safe)"""
         # Delete old record if this is a retry
         if is_retry:
             self.delete_existing_record(asset_id, file_key)
         
-        # Add to batch buffer
         record = {
             'asset_id': asset_id,
             'file_key': file_key,
@@ -700,11 +661,10 @@ class AudioFingerprintProcessor:
             'error_message': error_message
         }
         
-        should_flush = False
+        # Add to batch buffer
         with self.batch_lock:
             self.error_batch.append(record)
-            if len(self.error_batch) >= self.batch_size:
-                should_flush = True
+            should_flush = len(self.error_batch) >= self.batch_size
         
         # Flush if batch is full (outside lock to avoid blocking other threads)
         if should_flush:
@@ -827,8 +787,8 @@ class AudioFingerprintProcessor:
         # Note: ThreadPoolExecutor threads are already shut down at this point,
         # so connections are closed when threads terminate
         
-        # CRITICAL: Flush any remaining batches to database
-        logger.info("📦 Flushing remaining batches to database...")
+        # Flush any remaining records in batches
+        logger.info("Flushing remaining batches...")
         self.flush_all_batches()
         
         # Final results
@@ -879,8 +839,6 @@ def main():
     parser.add_argument('--asset-ids', help='Comma-separated list of asset IDs to process')
     parser.add_argument('--workers', type=int, default=4, 
                        help='Number of parallel workers (default: 4)')
-    parser.add_argument('--batch-size', type=int, default=100,
-                       help='Batch size for bulk INSERT operations (default: 100)')
     parser.add_argument('--retry-errors', action='store_true',
                        help='Retry processing assets that previously failed with ERROR status')
     parser.add_argument('--stats', action='store_true', help='Show processing statistics')
@@ -893,9 +851,8 @@ def main():
     
     # Initialize processor
     try:
-        processor = AudioFingerprintProcessor(max_workers=args.workers, batch_size=args.batch_size)
+        processor = AudioFingerprintProcessor(max_workers=args.workers)
         processor.ensure_table_exists()
-        logger.info(f"💾 Using batch size: {args.batch_size} (bulk INSERT mode)")
     except Exception as e:
         logger.error(f"❌ Failed to initialize processor: {e}")
         return 1

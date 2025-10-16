@@ -5,20 +5,30 @@ Smart Audio Duplicate Detector - UPGRADED VERSION
 Loads ALL fingerprints from Snowflake and uses duration-based clustering 
 with parallel processing to efficiently find duplicates.
 
+🎯 DEFAULT BEHAVIOR: Writes results to JSONL file (fast, cost-effective)
+📤 UPLOAD MODE: Load file and upload to Snowflake in batches (--load-and-upload)
+🔄 RESUME SUPPORT: Automatically resumes from checkpoint if interrupted
+
 Prioritizes cross-source comparisons (artlist ↔ motionarray).
 
 Usage:
-    # Cross-source comparisons (priority)
-    python duplicate_detector.py --mode cross-source --workers 8
+    # Step 1: Detect duplicates and write to file (auto-generates timestamped filename)
+    python duplicate_detector.py --mode cross-source --workers 12 --duration-tolerance 1.0
     
-    # Same-source comparisons
-    python duplicate_detector.py --mode same-source --workers 8
+    # If interrupted (Ctrl+C), just run the same command again - it will resume!
+    # Progress is saved in a .checkpoint file every 10 clusters
     
-    # All comparisons
-    python duplicate_detector.py --mode all --workers 8
+    # Step 1 (with custom filename):
+    python duplicate_detector.py --mode cross-source --output results/duplicates.jsonl
     
-    # Stats only
+    # Step 2: Load results from file and upload to Snowflake in batches
+    python duplicate_detector.py --load-and-upload duplicate_results_cross-source_20250116_143022.jsonl
+    
+    # Show statistics from Snowflake
     python duplicate_detector.py --stats
+    
+    # Start fresh (ignore checkpoint):
+    python duplicate_detector.py --mode cross-source --no-resume
 """
 
 import os
@@ -27,6 +37,7 @@ import logging
 import argparse
 import tempfile
 import shutil
+import json
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
@@ -36,6 +47,7 @@ import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import ctypes
+from datetime import datetime
 
 # Platform-specific environment setup
 SYSTEM = platform.system()
@@ -72,12 +84,19 @@ logger = logging.getLogger(__name__)
 class DuplicateDetector:
     """Smart duplicate detector using duration-based clustering with parallel processing"""
     
-    def __init__(self, max_workers: int = 4, batch_size: int = 100):
-        """Initialize the duplicate detector"""
+    def __init__(self, max_workers: int = 4, batch_size: int = 10000, output_file: Optional[str] = None):
+        """Initialize the duplicate detector
+        
+        Args:
+            max_workers: Number of parallel workers
+            batch_size: Batch size for Snowflake writes
+            output_file: If provided, write results to file instead of Snowflake
+        """
         self.snowflake = SnowflakeConnector()
         self.setup_chromaprint()
         self.max_workers = max_workers
         self.batch_size = batch_size
+        self.output_file = output_file
         self.stats_lock = Lock()
         self.comparison_lock = Lock()  # Lock for thread-safe fingerprint comparison
         self.stats = {
@@ -86,9 +105,17 @@ class DuplicateDetector:
             'skipped': 0,
             'start_time': None
         }
-        # Batch buffer for bulk INSERT (thread-safe)
+        # Batch writing buffer (thread-safe)
         self.batch_lock = Lock()
         self.duplicate_batch = []
+        
+        # File output buffer (if using file mode)
+        if self.output_file:
+            self.file_lock = Lock()
+            self.file_buffer = []
+            self.checkpoint_file = self.output_file + '.checkpoint'
+            self.checkpoint_lock = Lock()
+            self.completed_clusters = set()  # Track completed cluster indices
         
     def setup_chromaprint(self):
         """Set up Chromaprint library and environment (cross-platform)"""
@@ -373,63 +400,128 @@ class DuplicateDetector:
             return None
     
     def flush_duplicate_batch(self):
-        """Flush duplicate batch to Snowflake using bulk INSERT (thread-safe)"""
+        """Flush accumulated duplicate records to Snowflake (thread-safe)"""
         with self.batch_lock:
             if not self.duplicate_batch:
                 return
             
-            batch = self.duplicate_batch.copy()
+            batch_to_write = self.duplicate_batch.copy()
             self.duplicate_batch.clear()
         
-        if not batch:
+        if not batch_to_write:
             return
         
-        # Build multi-row INSERT statement
         insert_sql = """
         INSERT INTO AI_DATA.AUDIO_DETECTED_DUPLICATES 
         (ASSET_ID_1, ASSET_ID_2, IS_SAME_ASSET, SIMILARITY, DUPLICATE_TYPE,
          FILE_KEY_1, FORMAT_1, SOURCE_1, DURATION_1,
          FILE_KEY_2, FORMAT_2, SOURCE_2, DURATION_2, DURATION_DIFF)
-        VALUES 
+        VALUES (%(asset_id_1)s, %(asset_id_2)s, %(is_same_asset)s, %(similarity)s, %(duplicate_type)s,
+                %(file_key_1)s, %(format_1)s, %(source_1)s, %(duration_1)s,
+                %(file_key_2)s, %(format_2)s, %(source_2)s, %(duration_2)s, %(duration_diff)s)
         """
         
-        # Add value placeholders for each record
-        value_rows = []
-        params = {}
-        for i, record in enumerate(batch):
-            value_rows.append(
-                f"(%(asset_id_1_{i})s, %(asset_id_2_{i})s, %(is_same_asset_{i})s, %(similarity_{i})s, %(duplicate_type_{i})s, "
-                f"%(file_key_1_{i})s, %(format_1_{i})s, %(source_1_{i})s, %(duration_1_{i})s, "
-                f"%(file_key_2_{i})s, %(format_2_{i})s, %(source_2_{i})s, %(duration_2_{i})s, %(duration_diff_{i})s)"
-            )
-            params[f'asset_id_1_{i}'] = record['asset_id_1']
-            params[f'asset_id_2_{i}'] = record['asset_id_2']
-            params[f'is_same_asset_{i}'] = record['is_same_asset']
-            params[f'similarity_{i}'] = record['similarity']
-            params[f'duplicate_type_{i}'] = record['duplicate_type']
-            params[f'file_key_1_{i}'] = record['file_key_1']
-            params[f'format_1_{i}'] = record['format_1']
-            params[f'source_1_{i}'] = record['source_1']
-            params[f'duration_1_{i}'] = record['duration_1']
-            params[f'file_key_2_{i}'] = record['file_key_2']
-            params[f'format_2_{i}'] = record['format_2']
-            params[f'source_2_{i}'] = record['source_2']
-            params[f'duration_2_{i}'] = record['duration_2']
-            params[f'duration_diff_{i}'] = record['duration_diff']
-        
-        insert_sql += ',\n'.join(value_rows)
-        
         try:
-            cursor = self.snowflake.execute_query(insert_sql, params)
+            logger.info(f"💾 Flushing {len(batch_to_write)} duplicate records to Snowflake...")
+            cursor = self.snowflake.conn.cursor()
+            cursor.executemany(insert_sql, batch_to_write)
             cursor.close()
-            logger.info(f"💾 Flushed {len(batch)} duplicate pairs to database")
+            logger.info(f"✅ Successfully wrote {len(batch_to_write)} duplicate records")
         except Exception as e:
             logger.error(f"❌ Failed to flush duplicate batch: {e}")
             raise
     
+    def flush_file_buffer(self):
+        """Flush accumulated records to file (thread-safe)"""
+        if not self.output_file:
+            return
+        
+        with self.file_lock:
+            if not self.file_buffer:
+                return
+            
+            buffer_to_write = self.file_buffer.copy()
+            self.file_buffer.clear()
+        
+        if not buffer_to_write:
+            return
+        
+        try:
+            # Append to JSON lines file (one JSON object per line)
+            with open(self.output_file, 'a') as f:
+                for record in buffer_to_write:
+                    f.write(json.dumps(record) + '\n')
+            
+            logger.debug(f"💾 Wrote {len(buffer_to_write)} records to {self.output_file}")
+        except Exception as e:
+            logger.error(f"❌ Failed to write to file: {e}")
+            raise
+    
+    def load_checkpoint(self) -> Dict:
+        """Load checkpoint from file if it exists"""
+        if not self.output_file or not os.path.exists(self.checkpoint_file):
+            return {'completed_clusters': [], 'stats': {}}
+        
+        try:
+            with open(self.checkpoint_file, 'r') as f:
+                checkpoint = json.load(f)
+            
+            self.completed_clusters = set(checkpoint.get('completed_clusters', []))
+            logger.info(f"📥 Loaded checkpoint: {len(self.completed_clusters)} clusters already completed")
+            
+            return checkpoint
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to load checkpoint: {e}")
+            return {'completed_clusters': [], 'stats': {}}
+    
+    def save_checkpoint(self, current_cluster_idx: int, total_clusters: int, force: bool = False):
+        """Save checkpoint to file (thread-safe, throttled)"""
+        if not self.output_file:
+            return
+        
+        # Save every 10 clusters or when forced (at the end)
+        if not force and current_cluster_idx % 10 != 0:
+            return
+        
+        with self.checkpoint_lock:
+            try:
+                checkpoint = {
+                    'version': '1.0',
+                    'timestamp': datetime.now().isoformat(),
+                    'output_file': self.output_file,
+                    'completed_clusters': sorted(list(self.completed_clusters)),
+                    'total_clusters': total_clusters,
+                    'progress_pct': (len(self.completed_clusters) / total_clusters * 100) if total_clusters > 0 else 0,
+                    'stats': {
+                        'comparisons': self.stats['comparisons'],
+                        'duplicates': self.stats['duplicates'],
+                        'skipped': self.stats['skipped']
+                    }
+                }
+                
+                # Write checkpoint atomically (write to temp file, then rename)
+                temp_checkpoint = self.checkpoint_file + '.tmp'
+                with open(temp_checkpoint, 'w') as f:
+                    json.dump(checkpoint, f, indent=2)
+                
+                # Atomic rename
+                os.replace(temp_checkpoint, self.checkpoint_file)
+                
+                logger.debug(f"💾 Checkpoint saved: {len(self.completed_clusters)}/{total_clusters} clusters")
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to save checkpoint: {e}")
+    
+    def cleanup_checkpoint(self):
+        """Remove checkpoint file after successful completion"""
+        if self.output_file and os.path.exists(self.checkpoint_file):
+            try:
+                os.remove(self.checkpoint_file)
+                logger.info(f"🧹 Cleaned up checkpoint file")
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to cleanup checkpoint: {e}")
+    
     def store_duplicate(self, song1: Dict, song2: Dict, similarity: float, duplicate_type: str):
-        """Store duplicate pair in batch buffer (thread-safe, bulk INSERT)"""
-        # Add to batch buffer
+        """Store duplicate pair in buffer (file or Snowflake batch) (thread-safe)"""
         record = {
             'asset_id_1': song1['asset_id'],
             'asset_id_2': song2['asset_id'],
@@ -447,15 +539,22 @@ class DuplicateDetector:
             'duration_diff': abs(song1['duration'] - song2['duration'])
         }
         
-        should_flush = False
-        with self.batch_lock:
-            self.duplicate_batch.append(record)
-            if len(self.duplicate_batch) >= self.batch_size:
-                should_flush = True
-        
-        # Flush if batch is full (outside lock to avoid blocking other threads)
-        if should_flush:
-            self.flush_duplicate_batch()
+        if self.output_file:
+            # Write to file buffer
+            with self.file_lock:
+                self.file_buffer.append(record)
+                should_flush = len(self.file_buffer) >= 1000  # Flush file buffer more frequently
+            
+            if should_flush:
+                self.flush_file_buffer()
+        else:
+            # Write to Snowflake batch buffer
+            with self.batch_lock:
+                self.duplicate_batch.append(record)
+                should_flush = len(self.duplicate_batch) >= self.batch_size
+            
+            if should_flush:
+                self.flush_duplicate_batch()
         
         logger.debug(f"✅ Queued duplicate: {song1['asset_id']} <-> {song2['asset_id']} ({similarity:.3f})")
     
@@ -551,7 +650,8 @@ class DuplicateDetector:
     
     def detect_duplicates(self, mode: str = 'cross-source', 
                          similarity_threshold: float = 0.0,
-                         duration_tolerance: float = 5.0) -> Dict:
+                         duration_tolerance: float = 5.0,
+                         resume: bool = True) -> Dict:
         """
         Main duplicate detection process with parallel processing.
         
@@ -559,6 +659,7 @@ class DuplicateDetector:
             mode: 'cross-source' (artlist ↔ motionarray), 'same-source', or 'all'
             similarity_threshold: Minimum similarity to store (0.0 = store all for later analysis)
             duration_tolerance: Duration clustering tolerance in seconds
+            resume: If True and checkpoint exists, resume from checkpoint
         
         Returns:
             Dict with processing statistics
@@ -568,6 +669,13 @@ class DuplicateDetector:
         logger.info(f"   Similarity threshold: {similarity_threshold} (0.0 = store all)")
         logger.info(f"   Duration tolerance: ±{duration_tolerance}s")
         logger.info(f"   Parallel workers: {self.max_workers}")
+        
+        # Load checkpoint if resuming
+        checkpoint = {}
+        if resume and self.output_file:
+            checkpoint = self.load_checkpoint()
+            if self.completed_clusters:
+                logger.info(f"🔄 RESUMING from checkpoint: {len(self.completed_clusters)} clusters already completed")
         
         start_time = time.time()
         
@@ -606,11 +714,24 @@ class DuplicateDetector:
         
         logger.info(f"📊 Will process {len(clusters):,} clusters with {total_expected_pairs:,} comparisons")
         
+        # Count clusters to skip
+        clusters_to_skip = len(self.completed_clusters)
+        if clusters_to_skip > 0:
+            logger.info(f"⏭️  Skipping {clusters_to_skip} already completed clusters")
+        
         # Process each cluster
         for i, cluster in enumerate(clusters, 1):
+            # Skip if already completed (when resuming)
+            if i in self.completed_clusters:
+                logger.debug(f"⏭️  Skipping cluster {i} (already completed)")
+                continue
+            
             cluster_pairs = self.filter_cluster_by_mode(cluster, mode)
             
             if not cluster_pairs:
+                # Mark as completed even if no pairs
+                self.completed_clusters.add(i)
+                self.save_checkpoint(i, len(clusters))
                 continue
             
             logger.info(f"🔍 Cluster {i}/{len(clusters)} | Duration: {cluster[0]['duration']:.1f}s | "
@@ -619,21 +740,38 @@ class DuplicateDetector:
             # Process cluster in parallel
             self.find_duplicates_in_cluster_parallel(cluster, mode, similarity_threshold)
             
+            # Mark cluster as completed
+            self.completed_clusters.add(i)
+            
+            # Save checkpoint periodically
+            self.save_checkpoint(i, len(clusters))
+            
             # Progress update
-            if i % 100 == 0 or i == len(clusters):
+            if i % 10 == 0 or i == len(clusters):
                 with self.stats_lock:
                     elapsed = time.time() - self.stats['start_time']
                     rate = self.stats['comparisons'] / elapsed if elapsed > 0 else 0
+                    completed = len(self.completed_clusters)
                     
-                    logger.info(f"📈 Progress: {i}/{len(clusters)} clusters | "
+                    logger.info(f"📈 Progress: {completed}/{len(clusters)} clusters ({completed/len(clusters)*100:.1f}%) | "
                               f"Comparisons: {self.stats['comparisons']:,}/{total_expected_pairs:,} | "
                               f"Duplicates: {self.stats['duplicates']:,} | "
                               f"Rate: {rate:.0f} comp/sec | "
                               f"Elapsed: {elapsed/60:.1f}min")
         
-        # CRITICAL: Flush any remaining batches to database
-        logger.info("📦 Flushing remaining batches to database...")
-        self.flush_duplicate_batch()
+        # Flush any remaining records
+        if self.output_file:
+            logger.info("Flushing remaining records to file...")
+            self.flush_file_buffer()
+            
+            # Save final checkpoint and cleanup
+            self.save_checkpoint(len(clusters), len(clusters), force=True)
+            self.cleanup_checkpoint()
+            
+            logger.info(f"✅ All results written to: {self.output_file}")
+        else:
+            logger.info("Flushing remaining batch to Snowflake...")
+            self.flush_duplicate_batch()
         
         # Final results
         with self.stats_lock:
@@ -739,6 +877,110 @@ class DuplicateDetector:
         for similarity_range, count in stats.get('by_similarity', []):
             print(f"  {similarity_range}: {count}")
     
+    def load_and_upload_from_file(self, input_file: str) -> Dict:
+        """
+        Load duplicate results from file and upload to Snowflake in batches.
+        
+        Args:
+            input_file: Path to JSON lines file with duplicate records
+        
+        Returns:
+            Dict with upload statistics
+        """
+        logger.info(f"📥 Loading duplicates from: {input_file}")
+        
+        if not os.path.exists(input_file):
+            logger.error(f"❌ File not found: {input_file}")
+            return {'uploaded': 0, 'skipped': 0, 'errors': 0}
+        
+        # Ensure table exists
+        self.ensure_duplicates_table_exists()
+        
+        start_time = time.time()
+        uploaded = 0
+        skipped = 0
+        errors = 0
+        
+        batch = []
+        
+        try:
+            with open(input_file, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    try:
+                        record = json.loads(line.strip())
+                        
+                        # Check if already exists (to avoid duplicates on re-upload)
+                        if self.check_if_duplicate_exists(
+                            record['asset_id_1'], record['file_key_1'],
+                            record['asset_id_2'], record['file_key_2']
+                        ):
+                            skipped += 1
+                            continue
+                        
+                        batch.append(record)
+                        
+                        # Flush batch if full
+                        if len(batch) >= self.batch_size:
+                            self._upload_batch(batch)
+                            uploaded += len(batch)
+                            batch.clear()
+                            logger.info(f"📤 Uploaded {uploaded:,} records so far...")
+                        
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"⚠️  Skipping invalid JSON at line {line_num}: {e}")
+                        errors += 1
+                    except Exception as e:
+                        logger.warning(f"⚠️  Error processing line {line_num}: {e}")
+                        errors += 1
+                
+                # Flush remaining batch
+                if batch:
+                    self._upload_batch(batch)
+                    uploaded += len(batch)
+                    batch.clear()
+            
+            elapsed = time.time() - start_time
+            
+            logger.info(f"✅ Upload complete!")
+            logger.info(f"   Uploaded: {uploaded:,} records")
+            logger.info(f"   Skipped (already exist): {skipped:,}")
+            logger.info(f"   Errors: {errors:,}")
+            logger.info(f"   Time: {elapsed/60:.1f} minutes")
+            
+            return {
+                'uploaded': uploaded,
+                'skipped': skipped,
+                'errors': errors,
+                'time': elapsed
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load and upload from file: {e}")
+            raise
+    
+    def _upload_batch(self, batch: List[Dict]):
+        """Upload a batch of records to Snowflake"""
+        if not batch:
+            return
+        
+        insert_sql = """
+        INSERT INTO AI_DATA.AUDIO_DETECTED_DUPLICATES 
+        (ASSET_ID_1, ASSET_ID_2, IS_SAME_ASSET, SIMILARITY, DUPLICATE_TYPE,
+         FILE_KEY_1, FORMAT_1, SOURCE_1, DURATION_1,
+         FILE_KEY_2, FORMAT_2, SOURCE_2, DURATION_2, DURATION_DIFF)
+        VALUES (%(asset_id_1)s, %(asset_id_2)s, %(is_same_asset)s, %(similarity)s, %(duplicate_type)s,
+                %(file_key_1)s, %(format_1)s, %(source_1)s, %(duration_1)s,
+                %(file_key_2)s, %(format_2)s, %(source_2)s, %(duration_2)s, %(duration_diff)s)
+        """
+        
+        try:
+            cursor = self.snowflake.conn.cursor()
+            cursor.executemany(insert_sql, batch)
+            cursor.close()
+        except Exception as e:
+            logger.error(f"❌ Failed to upload batch: {e}")
+            raise
+    
     def close(self):
         """Close database connection"""
         if hasattr(self, 'snowflake'):
@@ -750,54 +992,87 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Cross-source comparisons (PRIORITY - artlist ↔ motionarray)
+  # Step 1: Detect duplicates (writes to auto-generated timestamped file)
   python duplicate_detector.py --mode cross-source --workers 8
 
-  # Same-source comparisons (artlist ↔ artlist, motionarray ↔ motionarray)
-  python duplicate_detector.py --mode same-source --workers 8
+  # Step 1 (with custom output file):
+  python duplicate_detector.py --mode cross-source --output results/duplicates.jsonl
 
-  # All comparisons
-  python duplicate_detector.py --mode all --workers 8
+  # Step 2: Load results from file and upload to Snowflake in batches
+  python duplicate_detector.py --load-and-upload duplicate_results_cross-source_20250116_143022.jsonl
 
-  # Show statistics
+  # Show statistics from Snowflake
   python duplicate_detector.py --stats
         """
     )
     parser.add_argument('--mode', choices=['cross-source', 'same-source', 'all'], 
-                       default='cross-source',
-                       help='Comparison mode (default: cross-source)')
+                       help='Comparison mode')
     parser.add_argument('--similarity-threshold', type=float, default=0.0,
                        help='Minimum similarity to store (default: 0.0 = store all for analysis)')
     parser.add_argument('--duration-tolerance', type=float, default=5.0,
                        help='Duration clustering tolerance in seconds (default: 5.0)')
     parser.add_argument('--workers', type=int, default=4,
                        help='Number of parallel workers (default: 4)')
-    parser.add_argument('--batch-size', type=int, default=100,
-                       help='Batch size for bulk INSERT operations (default: 100)')
+    parser.add_argument('--output', '--output-file', dest='output_file',
+                       help='Output file for results (JSONL format). If specified, writes to file instead of Snowflake.')
+    parser.add_argument('--load-and-upload', dest='load_file',
+                       help='Load results from file and upload to Snowflake in batches')
     parser.add_argument('--stats', action='store_true',
-                       help='Show statistics only')
+                       help='Show statistics from Snowflake')
+    parser.add_argument('--no-resume', action='store_true',
+                       help='Start fresh even if checkpoint exists (default: resume from checkpoint)')
     
     args = parser.parse_args()
     
     # Validate arguments
-    if not args.stats and not args.mode:
-        parser.error("Must specify --mode or --stats")
+    if not args.mode and not args.stats and not args.load_file:
+        parser.error("Must specify --mode, --stats, or --load-and-upload")
     
-    detector = DuplicateDetector(max_workers=args.workers, batch_size=args.batch_size)
-    logger.info(f"💾 Using batch size: {args.batch_size} (bulk INSERT mode)")
+    if args.mode and args.load_file:
+        parser.error("Cannot specify both --mode and --load-and-upload")
+    
+    # Generate default output filename if mode is specified but no output file
+    output_file = args.output_file
+    if args.mode and not output_file:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = f"duplicate_results_{args.mode}_{timestamp}.jsonl"
+        logger.info(f"📝 No output file specified, using: {output_file}")
+    
+    detector = DuplicateDetector(max_workers=args.workers, output_file=output_file)
     
     try:
         if args.stats:
             detector.print_stats()
+        elif args.load_file:
+            logger.info("="*80)
+            logger.info(f"LOADING AND UPLOADING FROM FILE")
+            logger.info("="*80)
+            
+            results = detector.load_and_upload_from_file(args.load_file)
+            
+            print("\n" + "="*80)
+            print("📊 UPLOAD RESULTS")
+            print("="*80)
+            print(f"   Input file: {args.load_file}")
+            print(f"   Records uploaded: {results['uploaded']:,}")
+            print(f"   Skipped (already exist): {results['skipped']:,}")
+            print(f"   Errors: {results['errors']:,}")
+            print(f"   Upload time: {results['time']/60:.1f} minutes")
+            print("="*80)
         else:
             logger.info("="*80)
             logger.info(f"DUPLICATE DETECTOR - {args.mode.upper()} MODE")
             logger.info("="*80)
+            if output_file:
+                logger.info(f"📝 Output mode: FILE ({output_file})")
+            else:
+                logger.info(f"📝 Output mode: SNOWFLAKE (direct write)")
             
             results = detector.detect_duplicates(
                 mode=args.mode,
                 similarity_threshold=args.similarity_threshold,
-                duration_tolerance=args.duration_tolerance
+                duration_tolerance=args.duration_tolerance,
+                resume=not args.no_resume
             )
             
             print("\n" + "="*80)
@@ -816,6 +1091,12 @@ Examples:
                 brute_force_comparisons = results['songs'] * (results['songs'] - 1) // 2
                 efficiency = (1 - results['comparisons'] / brute_force_comparisons) * 100 if brute_force_comparisons > 0 else 0
                 print(f"   Efficiency gain: {efficiency:.1f}% fewer comparisons than brute force")
+            
+            if output_file:
+                print(f"\n   ✅ Results written to: {output_file}")
+                print(f"   💡 To upload to Snowflake, run:")
+                print(f"      python duplicate_detector.py --load-and-upload {output_file}")
+            
             print("="*80)
     
     finally:
