@@ -8,6 +8,7 @@ with parallel processing to efficiently find duplicates.
 🎯 DEFAULT BEHAVIOR: Writes results to JSONL file (fast, cost-effective)
 📤 UPLOAD MODE: Load file and upload to Snowflake in batches (--load-and-upload)
 🔄 RESUME SUPPORT: Automatically resumes from checkpoint if interrupted
+⚠️  ERROR TRACKING: Failed comparisons saved to *_errors.jsonl for retry
 
 Prioritizes cross-source comparisons (artlist ↔ motionarray).
 
@@ -20,6 +21,9 @@ Usage:
     
     # Step 1 (with custom filename):
     python duplicate_detector.py --mode cross-source --output results/duplicates.jsonl
+    
+    # If errors occur, they're saved to: results/duplicates_errors.jsonl
+    # Analyze and retry: python duplicate_detector_retry_errors.py results/duplicates_errors.jsonl --analyze-only
     
     # Step 2: Load results from file and upload to Snowflake in batches
     python duplicate_detector.py --load-and-upload duplicate_results_cross-source_20250116_143022.jsonl
@@ -103,6 +107,7 @@ class DuplicateDetector:
             'comparisons': 0,
             'duplicates': 0,
             'skipped': 0,
+            'errors': 0,
             'start_time': None
         }
         # Batch writing buffer (thread-safe)
@@ -116,6 +121,11 @@ class DuplicateDetector:
             self.checkpoint_file = self.output_file + '.checkpoint'
             self.checkpoint_lock = Lock()
             self.completed_clusters = set()  # Track completed cluster indices
+            
+            # Error tracking (separate file for failed comparisons)
+            self.error_file = self.output_file.replace('.jsonl', '_errors.jsonl')
+            self.error_lock = Lock()
+            self.error_buffer = []
         
     def setup_chromaprint(self):
         """Set up Chromaprint library and environment (cross-platform)"""
@@ -457,6 +467,32 @@ class DuplicateDetector:
             logger.error(f"❌ Failed to write to file: {e}")
             raise
     
+    def flush_error_buffer(self):
+        """Flush accumulated error records to error file (thread-safe)"""
+        if not self.output_file:
+            return
+        
+        with self.error_lock:
+            if not self.error_buffer:
+                return
+            
+            buffer_to_write = self.error_buffer.copy()
+            self.error_buffer.clear()
+        
+        if not buffer_to_write:
+            return
+        
+        try:
+            # Append to JSON lines file (one JSON object per line)
+            with open(self.error_file, 'a') as f:
+                for record in buffer_to_write:
+                    f.write(json.dumps(record) + '\n')
+            
+            logger.debug(f"💾 Wrote {len(buffer_to_write)} error records to {self.error_file}")
+        except Exception as e:
+            logger.error(f"❌ Failed to write errors to file: {e}")
+            raise
+    
     def load_checkpoint(self) -> Dict:
         """Load checkpoint from file if it exists"""
         if not self.output_file or not os.path.exists(self.checkpoint_file):
@@ -558,6 +594,38 @@ class DuplicateDetector:
         
         logger.debug(f"✅ Queued duplicate: {song1['asset_id']} <-> {song2['asset_id']} ({similarity:.3f})")
     
+    def store_error(self, song1: Dict, song2: Dict, error_type: str, error_message: str):
+        """Store failed comparison in error buffer (thread-safe)"""
+        if not self.output_file:
+            # Only track errors when writing to file (for retry capability)
+            return
+        
+        error_record = {
+            'error_type': error_type,
+            'error_message': error_message,
+            'timestamp': datetime.now().isoformat(),
+            'asset_id_1': song1['asset_id'],
+            'file_key_1': song1['file_key'],
+            'format_1': song1['format'],
+            'source_1': song1['source'],
+            'duration_1': song1['duration'],
+            'asset_id_2': song2['asset_id'],
+            'file_key_2': song2['file_key'],
+            'format_2': song2['format'],
+            'source_2': song2['source'],
+            'duration_2': song2['duration'],
+            'duration_diff': abs(song1['duration'] - song2['duration'])
+        }
+        
+        with self.error_lock:
+            self.error_buffer.append(error_record)
+            should_flush = len(self.error_buffer) >= 100  # Flush error buffer periodically
+        
+        if should_flush:
+            self.flush_error_buffer()
+        
+        logger.debug(f"⚠️  Queued error: {song1['asset_id']} <-> {song2['asset_id']} | {error_type}: {error_message}")
+    
     def compare_and_store_pair(self, pair: Tuple[Dict, Dict], similarity_threshold: float = 0.0) -> Optional[Dict]:
         """
         Compare a single pair of songs and store if they're similar.
@@ -582,11 +650,19 @@ class DuplicateDetector:
             # Compare fingerprints
             similarity = self.compare_fingerprints(song1, song2)
             
+            # Check if comparison failed
+            if similarity is None:
+                # Record the error for retry
+                self.store_error(song1, song2, 'COMPARISON_FAILED', 'Fingerprint comparison returned None')
+                with self.stats_lock:
+                    self.stats['errors'] += 1
+                return None
+            
             # Update comparison count
             with self.stats_lock:
                 self.stats['comparisons'] += 1
             
-            if similarity is not None and similarity >= similarity_threshold:
+            if similarity >= similarity_threshold:
                 duplicate_type = self.classify_duplicate_type(song1, song2, similarity)
                 
                 # Store in database
@@ -609,7 +685,12 @@ class DuplicateDetector:
             return None
             
         except Exception as e:
-            logger.error(f"❌ Failed to compare pair: {e}")
+            error_msg = str(e)
+            logger.error(f"❌ Failed to compare pair: {error_msg}")
+            # Record the error for retry
+            self.store_error(song1, song2, 'EXCEPTION', error_msg)
+            with self.stats_lock:
+                self.stats['errors'] += 1
             return None
     
     def find_duplicates_in_cluster_parallel(self, cluster: List[Dict], mode: str, 
@@ -685,6 +766,7 @@ class DuplicateDetector:
                 'comparisons': 0,
                 'duplicates': 0,
                 'skipped': 0,
+                'errors': 0,
                 'start_time': start_time
             }
         
@@ -763,12 +845,15 @@ class DuplicateDetector:
         if self.output_file:
             logger.info("Flushing remaining records to file...")
             self.flush_file_buffer()
+            self.flush_error_buffer()
             
             # Save final checkpoint and cleanup
             self.save_checkpoint(len(clusters), len(clusters), force=True)
             self.cleanup_checkpoint()
             
             logger.info(f"✅ All results written to: {self.output_file}")
+            if self.stats['errors'] > 0:
+                logger.info(f"⚠️  Errors written to: {self.error_file}")
         else:
             logger.info("Flushing remaining batch to Snowflake...")
             self.flush_duplicate_batch()
@@ -780,6 +865,7 @@ class DuplicateDetector:
                 'duplicates': self.stats['duplicates'],
                 'comparisons': self.stats['comparisons'],
                 'skipped': self.stats['skipped'],
+                'errors': self.stats['errors'],
                 'clusters': len(clusters),
                 'songs': len(songs),
                 'time': elapsed_time,
@@ -789,6 +875,8 @@ class DuplicateDetector:
         logger.info(f"✅ Duplicate detection complete!")
         logger.info(f"📊 Found {results['duplicates']:,} duplicate pairs")
         logger.info(f"📊 Made {results['comparisons']:,} comparisons (skipped {results['skipped']:,} existing)")
+        if results['errors'] > 0:
+            logger.warning(f"⚠️  Encountered {results['errors']:,} errors (saved to {self.error_file if self.output_file else 'not tracked'})")
         logger.info(f"📊 Processed {results['clusters']:,} clusters in {elapsed_time/60:.1f} minutes")
         logger.info(f"📊 Rate: {results['rate']:.0f} comparisons/second")
         
@@ -998,6 +1086,9 @@ Examples:
   # Step 1 (with custom output file):
   python duplicate_detector.py --mode cross-source --output results/duplicates.jsonl
 
+  # Analyze errors if any occurred:
+  python duplicate_detector_retry_errors.py results/duplicates_errors.jsonl --analyze-only
+
   # Step 2: Load results from file and upload to Snowflake in batches
   python duplicate_detector.py --load-and-upload duplicate_results_cross-source_20250116_143022.jsonl
 
@@ -1082,6 +1173,8 @@ Examples:
             print(f"   Duplicate pairs found: {results['duplicates']:,}")
             print(f"   Comparisons made: {results['comparisons']:,}")
             print(f"   Skipped (already processed): {results['skipped']:,}")
+            if results['errors'] > 0:
+                print(f"   ⚠️  Errors encountered: {results['errors']:,}")
             print(f"   Duration clusters: {results['clusters']:,}")
             print(f"   Songs processed: {results['songs']:,}")
             print(f"   Processing time: {results['time']/60:.1f} minutes")
@@ -1094,6 +1187,10 @@ Examples:
             
             if output_file:
                 print(f"\n   ✅ Results written to: {output_file}")
+                if results['errors'] > 0:
+                    error_file = output_file.replace('.jsonl', '_errors.jsonl')
+                    print(f"   ⚠️  Errors written to: {error_file}")
+                    print(f"   💡 To retry errors, you can process the error file separately")
                 print(f"   💡 To upload to Snowflake, run:")
                 print(f"      python duplicate_detector.py --load-and-upload {output_file}")
             
