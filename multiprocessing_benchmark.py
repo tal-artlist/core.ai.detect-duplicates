@@ -150,9 +150,9 @@ class MultiprocessingBenchmark:
         """Test different numbers of processes"""
         logger.info(f"🔢 Testing process scaling with {num_comparisons} comparisons")
         
-        # Test different process counts - focus on your 36 cores
+        # Test different process counts optimized for this system
         max_cpu = cpu_count()
-        process_counts = [1, 2, 4, 8, 12, 16, 24, 32, max_cpu]
+        process_counts = [1, 4, 8, 12, 16, 24, 32, 40, 48, max_cpu]
         process_counts = sorted(list(set([p for p in process_counts if p <= max_cpu and p >= 1])))
         
         results = {}
@@ -211,18 +211,18 @@ class MultiprocessingBenchmark:
     
     def run_benchmark(self):
         """Run comprehensive benchmark"""
-        fingerprints = self.load_test_fingerprints(limit=500)
+        fingerprints = self.load_test_fingerprints(limit=200)
         
         if len(fingerprints) < 10:
             raise ValueError("Need at least 10 fingerprints for testing")
         
         print("\n" + "="*80)
-        print("🚀 MULTIPROCESSING BENCHMARK - 36 CORE SYSTEM")
+        print("🚀 MULTIPROCESSING BENCHMARK")
         print("="*80)
         print(f"System CPU cores: {cpu_count()}")
         print(f"Test fingerprints: {len(fingerprints)}")
         
-        num_comparisons = 1000
+        num_comparisons = 500
         
         print(f"\n📊 PROCESS SCALING TEST ({num_comparisons} comparisons)")
         print("="*80)

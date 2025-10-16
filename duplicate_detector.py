@@ -100,10 +100,27 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 def setup_chromaprint_for_worker():
-    """Setup chromaprint for each worker process - lightweight version"""
-    # Don't try to load libraries - just use acoustid's built-in functionality
-    # The acoustid module will handle this automatically
-    return True
+    """Setup chromaprint for each worker process"""
+    try:
+        fpcalc_path = shutil.which('fpcalc')
+        if not fpcalc_path:
+            if SYSTEM == 'Darwin':
+                candidate_paths = ['/opt/homebrew/bin/fpcalc', '/usr/local/bin/fpcalc']
+            else:
+                candidate_paths = ['/usr/bin/fpcalc', '/usr/local/bin/fpcalc']
+            
+            for path in candidate_paths:
+                if os.path.exists(path):
+                    fpcalc_path = path
+                    break
+        
+        if fpcalc_path:
+            os.environ['FPCALC_COMMAND'] = fpcalc_path
+            acoustid.FPCALC_COMMAND = fpcalc_path
+            return True
+    except:
+        pass
+    return False
 
 def process_comparison_worker(work_data):
     """
@@ -117,6 +134,9 @@ def process_comparison_worker(work_data):
         Dict with comparison results
     """
     try:
+        # Setup chromaprint for this worker process
+        setup_chromaprint_for_worker()
+        
         song1, song2, pair_id = work_data
         
         # Skip if same file
@@ -125,6 +145,14 @@ def process_comparison_worker(work_data):
                 'pair_id': pair_id,
                 'skipped': True,
                 'reason': 'same_file'
+            }
+        
+        # Skip if same asset (just different formats - obvious duplicate)
+        if song1['asset_id'] == song2['asset_id']:
+            return {
+                'pair_id': pair_id,
+                'skipped': True,
+                'reason': 'same_asset'
             }
         
         # Convert fingerprints to bytes
@@ -829,16 +857,10 @@ class DuplicateDetector:
         duplicates_found = 0
         
         # Prepare work data for worker processes (song1, song2, pair_id)
-        work_items = []
-        for idx, (song1, song2) in enumerate(pairs):
-            # Check if already processed (to save on useless comparisons)
-            if self.check_if_duplicate_exists(song1['asset_id'], song1['file_key'], 
-                                             song2['asset_id'], song2['file_key']):
-                with self.stats_lock:
-                    self.stats['skipped'] += 1
-                continue
-            
-            work_items.append((song1, song2, idx))
+        # Note: We skip the check_if_duplicate_exists() here because it's too slow
+        # (thousands of database queries). Instead, we'll handle duplicates via 
+        # the UNIQUE constraint on the table when uploading.
+        work_items = [(song1, song2, idx) for idx, (song1, song2) in enumerate(pairs)]
         
         if not work_items:
             return 0
@@ -890,7 +912,7 @@ class DuplicateDetector:
                             self.stats['last_progress_time'] = time.time()
                             
                             logger.info(f"⚡ {comparisons_count:,} comparisons | "
-                                      f"{self.stats['duplicates']:,} duplicates | "
+                                      f"{self.stats['duplicates']:,} possible duplicates | "
                                       f"Avg: {rate:.0f} comp/sec")
                     
                     # Check threshold and store if needed
@@ -1048,7 +1070,7 @@ class DuplicateDetector:
             
             cluster_rate = cluster_comps / cluster_time if cluster_time > 0 else 0
             logger.info(f"   ✅ Done: {cluster_comps:,} comparisons in {cluster_time:.1f}s ({cluster_rate:.0f} comp/sec) | "
-                       f"{cluster_dups} duplicates, {cluster_errs} errors")
+                       f"{cluster_dups} possible duplicates, {cluster_errs} errors")
             
             # Mark cluster as completed
             self.completed_clusters.add(i)
@@ -1066,7 +1088,7 @@ class DuplicateDetector:
                     logger.info(f"\n" + "="*80)
                     logger.info(f"📊 OVERALL PROGRESS: {completed}/{len(clusters)} clusters ({completed/len(clusters)*100:.1f}%)")
                     logger.info(f"   Total Comparisons: {self.stats['comparisons']:,} | "
-                              f"Duplicates: {self.stats['duplicates']:,} | "
+                              f"Possible Duplicates: {self.stats['duplicates']:,} | "
                               f"Errors: {self.stats['errors']}")
                     logger.info(f"   Average Rate: {rate:.0f} comp/sec | "
                               f"Elapsed: {elapsed/60:.1f}min")
@@ -1121,7 +1143,7 @@ class DuplicateDetector:
             }
         
         logger.info(f"✅ Duplicate detection complete!")
-        logger.info(f"📊 Found {results['duplicates']:,} duplicate pairs")
+        logger.info(f"📊 Found {results['duplicates']:,} possible duplicate pairs (similarity >= threshold)")
         logger.info(f"📊 Made {results['comparisons']:,} comparisons (skipped {results['skipped']:,} existing)")
         if results['errors'] > 0:
             logger.warning(f"⚠️  Encountered {results['errors']:,} errors (saved to {self.error_file if self.output_file else 'not tracked'})")
@@ -1422,7 +1444,8 @@ Examples:
             print("📊 FINAL RESULTS")
             print("="*80)
             print(f"   Mode: {args.mode}")
-            print(f"   Duplicate pairs found: {results['duplicates']:,}")
+            print(f"   Similarity threshold: {args.similarity_threshold}")
+            print(f"   Possible duplicate pairs found: {results['duplicates']:,}")
             print(f"   Comparisons made: {results['comparisons']:,}")
             print(f"   Skipped (already processed): {results['skipped']:,}")
             if results['errors'] > 0:
