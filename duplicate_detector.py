@@ -877,15 +877,21 @@ class DuplicateDetector:
                     with self.stats_lock:
                         self.stats['comparisons'] += 1
                         comparisons_count = self.stats['comparisons']
+                        current_time = time.time()
+                        time_since_last_progress = current_time - self.stats['last_progress_time']
                     
-                    # Progress update every 1000 comparisons
-                    if comparisons_count % 1000 == 0:
+                    # Progress update every 1000 comparisons OR every 5 seconds
+                    show_progress = (comparisons_count % 1000 == 0) or (time_since_last_progress >= 5.0)
+                    
+                    if show_progress:
                         with self.stats_lock:
                             elapsed = time.time() - self.stats['start_time']
                             rate = self.stats['comparisons'] / elapsed if elapsed > 0 else 0
+                            self.stats['last_progress_time'] = time.time()
+                            
                             logger.info(f"⚡ {comparisons_count:,} comparisons | "
                                       f"{self.stats['duplicates']:,} duplicates | "
-                                      f"{rate:.0f} comp/sec")
+                                      f"Avg: {rate:.0f} comp/sec")
                     
                     # Check threshold and store if needed
                     if similarity >= similarity_threshold:
@@ -963,7 +969,8 @@ class DuplicateDetector:
                 'duplicates': 0,
                 'skipped': 0,
                 'errors': 0,
-                'start_time': start_time
+                'start_time': start_time,
+                'last_progress_time': start_time  # Track last progress log time
             }
         
         # Ensure tables exist
@@ -1017,12 +1024,31 @@ class DuplicateDetector:
                 self.save_checkpoint(i, len(clusters))
                 continue
             
-            # Log cluster start (less verbose now that we have 1000-comparison updates)
+            # Log cluster start
             logger.info(f"🔍 Cluster {i}/{len(clusters)} | Duration: {cluster[0]['duration']:.1f}s | "
                        f"Songs: {len(cluster)} | Pairs: {len(cluster_pairs):,}")
             
+            # Track stats before processing
+            with self.stats_lock:
+                comparisons_before = self.stats['comparisons']
+                duplicates_before = self.stats['duplicates']
+                errors_before = self.stats['errors']
+            
+            cluster_start_time = time.time()
+            
             # Process cluster in parallel
             self.find_duplicates_in_cluster_parallel(cluster, mode, similarity_threshold)
+            
+            # Show cluster completion
+            cluster_time = time.time() - cluster_start_time
+            with self.stats_lock:
+                cluster_comps = self.stats['comparisons'] - comparisons_before
+                cluster_dups = self.stats['duplicates'] - duplicates_before
+                cluster_errs = self.stats['errors'] - errors_before
+            
+            cluster_rate = cluster_comps / cluster_time if cluster_time > 0 else 0
+            logger.info(f"   ✅ Done: {cluster_comps:,} comparisons in {cluster_time:.1f}s ({cluster_rate:.0f} comp/sec) | "
+                       f"{cluster_dups} duplicates, {cluster_errs} errors")
             
             # Mark cluster as completed
             self.completed_clusters.add(i)
