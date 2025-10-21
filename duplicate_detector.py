@@ -100,7 +100,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 def setup_chromaprint_for_worker():
-    """Setup chromaprint for each worker process"""
+    """Setup chromaprint for each worker process - called ONCE per worker"""
     try:
         fpcalc_path = shutil.which('fpcalc')
         if not fpcalc_path:
@@ -122,6 +122,11 @@ def setup_chromaprint_for_worker():
         pass
     return False
 
+# Worker initialization function - called ONCE per worker process
+def init_worker():
+    """Initialize worker process - sets up chromaprint once"""
+    setup_chromaprint_for_worker()
+
 def process_comparison_worker(work_data):
     """
     Worker function for multiprocessing - compares a single pair of songs.
@@ -134,9 +139,7 @@ def process_comparison_worker(work_data):
         Dict with comparison results
     """
     try:
-        # Setup chromaprint for this worker process
-        setup_chromaprint_for_worker()
-        
+        # NO setup call here - worker is initialized once via init_worker()
         song1, song2, pair_id = work_data
         
         # Skip if same file
@@ -230,7 +233,7 @@ def process_comparison_worker(work_data):
 class DuplicateDetector:
     """Smart duplicate detector using duration-based clustering with parallel processing"""
     
-    def __init__(self, max_workers: int = 4, batch_size: int = 10000, output_file: Optional[str] = None):
+    def __init__(self, max_workers: int = 4, batch_size: int = 1000, output_file: Optional[str] = None):
         """Initialize the duplicate detector
         
         Args:
@@ -867,89 +870,134 @@ class DuplicateDetector:
         
         # Process pairs in parallel with MULTIPROCESSING 🚀
         # Each process runs independently, no GIL, pure parallel CPU power!
-        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(process_comparison_worker, work): work[2] 
-                      for work in work_items}
+        # Use batched submission to avoid overwhelming the executor with huge clusters
+        # OPTIMIZATION: Use initializer to set up each worker process ONCE
+        with ProcessPoolExecutor(max_workers=self.max_workers, initializer=init_worker) as executor:
+            # Submit work in batches to prevent queue overflow with massive clusters
+            batch_size = max(1000, self.max_workers * 100)  # Keep reasonable number of futures in flight
+            futures = {}
+            work_idx = 0
+            completed_count = 0
             
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    
-                    if result.get('skipped'):
-                        with self.stats_lock:
-                            self.stats['skipped'] += 1
-                        continue
-                    
-                    if not result.get('success'):
-                        # Handle error
-                        error = result.get('error', 'unknown')
-                        work_item = work_items[result['pair_id']]
-                        song1, song2 = work_item[0], work_item[1]
+            # Initial batch submission
+            while work_idx < len(work_items) and len(futures) < batch_size:
+                work = work_items[work_idx]
+                future = executor.submit(process_comparison_worker, work)
+                futures[future] = work[2]  # map future to pair_id
+                work_idx += 1
+            
+            # Process results and submit more work as futures complete
+            while futures:
+                done_futures = []
+                for future in as_completed(list(futures.keys()), timeout=10):
+                    try:
+                        result = future.result(timeout=30)  # 30 second timeout per comparison
+                        done_futures.append(future)
+                        completed_count += 1
                         
-                        # Store error for retry
-                        self.store_error(song1, song2, 'COMPARISON_FAILED', error)
+                        if result.get('skipped'):
+                            with self.stats_lock:
+                                self.stats['skipped'] += 1
+                            continue
                         
-                        with self.stats_lock:
-                            self.stats['errors'] += 1
-                        continue
-                    
-                    # Successful comparison
-                    similarity = result['similarity']
-                    
-                    with self.stats_lock:
-                        self.stats['comparisons'] += 1
-                        comparisons_count = self.stats['comparisons']
-                        current_time = time.time()
-                        time_since_last_progress = current_time - self.stats['last_progress_time']
-                    
-                    # Progress update every 1000 comparisons OR every 5 seconds
-                    show_progress = (comparisons_count % 1000 == 0) or (time_since_last_progress >= 5.0)
-                    
-                    if show_progress:
-                        with self.stats_lock:
-                            elapsed = time.time() - self.stats['start_time']
-                            rate = self.stats['comparisons'] / elapsed if elapsed > 0 else 0
-                            self.stats['last_progress_time'] = time.time()
-                            
-                            logger.info(f"⚡ {comparisons_count:,} comparisons | "
-                                      f"{self.stats['duplicates']:,} possible duplicates | "
-                                      f"Avg: {rate:.0f} comp/sec")
-                    
-                    # Check threshold and store if needed
-                    if similarity >= similarity_threshold:
-                        record = result['record']
-                        
-                        # Store duplicate
-                        if self.output_file:
-                            # Write to file
-                            with self.file_lock:
-                                self.file_buffer.append(record)
-                                if len(self.file_buffer) >= self.batch_size:
-                                    self.flush_file_buffer()
-                        else:
-                            # Store in database
-                            with self.batch_lock:
-                                self.duplicate_batch.append(record)
-                                if len(self.duplicate_batch) >= self.batch_size:
-                                    self.flush_database_batch()
-                        
-                        with self.stats_lock:
-                            self.stats['duplicates'] += 1
-                        
-                        duplicates_found += 1
-                        
-                        # Log if high similarity
-                        if similarity >= 0.60:
+                        if not result.get('success'):
+                            # Handle error
+                            error = result.get('error', 'unknown')
                             work_item = work_items[result['pair_id']]
                             song1, song2 = work_item[0], work_item[1]
-                            logger.info(f"🔍 Duplicate: {song1['asset_id']} ({song1['source']}/{song1['format']}) <-> "
-                                      f"{song2['asset_id']} ({song2['source']}/{song2['format']}) | "
-                                      f"Similarity: {similarity:.3f} | {result['duplicate_type']}")
+                            
+                            # Store error for retry
+                            self.store_error(song1, song2, 'COMPARISON_FAILED', error)
+                            
+                            with self.stats_lock:
+                                self.stats['errors'] += 1
+                            continue
+                        
+                        # Successful comparison
+                        similarity = result['similarity']
+                        
+                        with self.stats_lock:
+                            self.stats['comparisons'] += 1
+                            comparisons_count = self.stats['comparisons']
+                            current_time = time.time()
+                            time_since_last_progress = current_time - self.stats['last_progress_time']
+                        
+                        # Progress update every 1000 comparisons OR every 5 seconds
+                        show_progress = (comparisons_count % 1000 == 0) or (time_since_last_progress >= 5.0)
+                        
+                        if show_progress:
+                            with self.stats_lock:
+                                # Calculate rate based on RECENT activity (since last progress update)
+                                elapsed_since_last = time.time() - self.stats['last_progress_time']
+                                # Store previous comparison count for rate calculation
+                                if 'last_comparisons' not in self.stats:
+                                    self.stats['last_comparisons'] = 0
+                                
+                                comparisons_since_last = comparisons_count - self.stats['last_comparisons']
+                                rate = comparisons_since_last / elapsed_since_last if elapsed_since_last > 0 else 0
+                                
+                                self.stats['last_comparisons'] = comparisons_count
+                                self.stats['last_progress_time'] = time.time()
+                                
+                                logger.info(f"⚡ {comparisons_count:,} comparisons | "
+                                          f"{self.stats['duplicates']:,} possible duplicates | "
+                                          f"Rate: {rate:.0f} comp/sec")
+                            
+                            # Flush buffers periodically during progress updates to avoid data loss
+                            if self.output_file:
+                                self.flush_file_buffer()
+                                self.flush_error_buffer()
+                        
+                        # Check threshold and store if needed
+                        if similarity >= similarity_threshold:
+                            record = result['record']
+                            
+                            # Store duplicate
+                            if self.output_file:
+                                # Write to file
+                                with self.file_lock:
+                                    self.file_buffer.append(record)
+                                    if len(self.file_buffer) >= self.batch_size:
+                                        self.flush_file_buffer()
+                            else:
+                                # Store in database
+                                with self.batch_lock:
+                                    self.duplicate_batch.append(record)
+                                    if len(self.duplicate_batch) >= self.batch_size:
+                                        self.flush_database_batch()
+                            
+                            with self.stats_lock:
+                                self.stats['duplicates'] += 1
+                            
+                            duplicates_found += 1
+                            
+                            # Log if high similarity
+                            if similarity >= 0.60:
+                                work_item = work_items[result['pair_id']]
+                                song1, song2 = work_item[0], work_item[1]
+                                logger.info(f"🔍 Duplicate: {song1['asset_id']} ({song1['source']}/{song1['format']}) <-> "
+                                          f"{song2['asset_id']} ({song2['source']}/{song2['format']}) | "
+                                          f"Similarity: {similarity:.3f} | {result['duplicate_type']}")
                     
-                except Exception as e:
-                    logger.error(f"❌ Failed to process comparison result: {e}")
-                    with self.stats_lock:
-                        self.stats['errors'] += 1
+                    except Exception as e:
+                        logger.error(f"❌ Failed to process comparison result: {e}")
+                        with self.stats_lock:
+                            self.stats['errors'] += 1
+                    
+                    # Always try to break out of as_completed after processing one result
+                    # This allows us to clean up and submit new work
+                    break
+                
+                # Remove completed futures
+                for done_future in done_futures:
+                    del futures[done_future]
+                
+                # Submit more work to keep the pipeline full
+                while work_idx < len(work_items) and len(futures) < batch_size:
+                    work = work_items[work_idx]
+                    future = executor.submit(process_comparison_worker, work)
+                    futures[future] = work[2]
+                    work_idx += 1
         
         return duplicates_found
     
@@ -1074,6 +1122,13 @@ class DuplicateDetector:
             
             # Mark cluster as completed
             self.completed_clusters.add(i)
+            
+            # Flush buffers after each cluster to ensure incremental progress is saved
+            if self.output_file:
+                self.flush_file_buffer()
+                self.flush_error_buffer()
+            else:
+                self.flush_duplicate_batch()
             
             # Save checkpoint periodically
             self.save_checkpoint(i, len(clusters))
@@ -1340,7 +1395,14 @@ class DuplicateDetector:
             raise
     
     def close(self):
-        """Close database connection"""
+        """Close database connection and flush any remaining buffers"""
+        # Flush any remaining data before closing
+        if self.output_file:
+            self.flush_file_buffer()
+            self.flush_error_buffer()
+        else:
+            self.flush_duplicate_batch()
+        
         if hasattr(self, 'snowflake'):
             self.snowflake.close()
 
