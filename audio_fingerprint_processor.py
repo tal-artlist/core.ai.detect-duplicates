@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 class AudioFingerprintProcessor:
     """Processor with parallel processing and source filtering"""
     
-    def __init__(self, max_workers: int = 4, batch_size: int = 10000):
+    def __init__(self, max_workers: int = 4, batch_size: int = 5000):
         self.snowflake = SnowflakeConnector()
         self.acoustid = self.setup_chromaprint()
         self.max_workers = max_workers
@@ -495,7 +495,8 @@ class AudioFingerprintProcessor:
                 return None
             
             # Attempt fingerprint generation
-            duration, fingerprint = self.acoustid.fingerprint_file(str(file_path))
+            # Use maxlength=10000 to fingerprint the entire file (safe alternative to 0 which can fail)
+            duration, fingerprint = self.acoustid.fingerprint_file(str(file_path), maxlength=10000)
             
             # Validate results
             if duration is None or duration <= 0:
@@ -577,8 +578,10 @@ class AudioFingerprintProcessor:
         
         try:
             logger.info(f"💾 Flushing {len(batch_to_write)} fingerprint records to Snowflake...")
-            cursor = self.snowflake.conn.cursor()
+            conn = self.snowflake._get_connection()
+            cursor = conn.cursor()
             cursor.executemany(insert_sql, batch_to_write)
+            conn.commit()
             cursor.close()
             logger.info(f"✅ Successfully wrote {len(batch_to_write)} fingerprint records")
         except Exception as e:
@@ -605,8 +608,10 @@ class AudioFingerprintProcessor:
         
         try:
             logger.info(f"💾 Flushing {len(batch_to_write)} error records to Snowflake...")
-            cursor = self.snowflake.conn.cursor()
+            conn = self.snowflake._get_connection()
+            cursor = conn.cursor()
             cursor.executemany(insert_sql, batch_to_write)
+            conn.commit()
             cursor.close()
             logger.info(f"✅ Successfully wrote {len(batch_to_write)} error records")
         except Exception as e:

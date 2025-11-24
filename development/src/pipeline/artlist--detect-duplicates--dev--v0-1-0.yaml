@@ -1,0 +1,89 @@
+components:
+  comp-download-song-op:
+    executorLabel: exec-download-song-op
+    inputDefinitions:
+      parameters:
+        asset_id:
+          parameterType: NUMBER_INTEGER
+    outputDefinitions:
+      parameters:
+        Output:
+          parameterType: STRING
+defaultPipelineRoot: gs://artlist--detect-duplicates--dev/pipelines/artlist--detect-duplicates--dev--v0-1-0
+deploymentSpec:
+  executors:
+    exec-download-song-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - download_song_op
+        command:
+        - sh
+        - -c
+        - "load-dependencies artlist-ai-dev -d gs://artlist--detect-duplicates--dev/assets/artlist--detect-duplicates--dev--v0-1-0/download_utils.tar.gz\n\
+          if ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3\
+          \ -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.8.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'cryptography'\
+          \ 'snowflake-connector-python' 'google-cloud-secret-manager' 'requests'\
+          \ && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef download_song_op(\n    asset_id: int\n) -> str:\n    import os\n\
+          \    import logging\n    from download_utils.download_song import get_file_key,\
+          \ get_download_url, download_file\n\n    logging.basicConfig(level=logging.INFO)\n\
+          \    logger = logging.getLogger(__name__)\n\n    logger.info(f\"Looking\
+          \ up asset {asset_id}...\")\n    file_info = get_file_key(asset_id)\n  \
+          \  if not file_info:\n        msg = f\"Asset {asset_id} not found in Artlist\
+          \ or MotionArray\"\n        logger.error(msg)\n        raise ValueError(msg)\n\
+          \n    logger.info(f\"Found: {file_info['source']} {file_info['format']}\"\
+          )\n\n    logger.info(f\"Getting download URL...\")\n    url = get_download_url(file_info['file_key'])\n\
+          \    if not url:\n        msg = f\"Could not get download URL\"\n      \
+          \  logger.error(msg)\n        raise ValueError(msg)\n\n    filename = f\"\
+          asset_{asset_id}_{file_info['source']}.{file_info['format'].lower()}\"\n\
+          \    # Save to a path that will be preserved or just temp?\n    # The user\
+          \ just wants to download it. In a pipeline, files are ephemeral unless saved\
+          \ to output artifact.\n    # But the prompt says \"it will download the\
+          \ song and thats it\".\n\n    output_path = filename\n\n    logger.info(f\"\
+          Downloading to {output_path}...\")\n    download_file(url, output_path)\n\
+          \n    file_size = os.path.getsize(output_path) / 1024 / 1024\n    logger.info(f\"\
+          Downloaded {file_size:.1f} MB successfully!\")\n\n    return output_path\n\
+          \n"
+        image: europe-west4-docker.pkg.dev/artlist-ai-dev/kf-components/slim:v2.2.1
+pipelineInfo:
+  description: Simple pipeline to download a song.
+  name: artlist--detect-duplicates--dev--v0-1-0
+root:
+  dag:
+    tasks:
+      download-song-op:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-download-song-op
+        inputs:
+          parameters:
+            asset_id:
+              componentInputParameter: asset_id
+        taskInfo:
+          name: Download Song
+  inputDefinitions:
+    parameters:
+      asset_id:
+        defaultValue: 122429.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.8.0

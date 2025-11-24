@@ -1,0 +1,8 @@
+include:
+  - project: 'artlistltd/content/core-content-registry'
+    ref: master
+    file: '.gitlab-ci-docker-build.yml'
+
+variables:
+  SERVICE_NAME: 'detect-duplicates'
+  PR_FLOW_ENABLED: 'false'
