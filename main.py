@@ -97,8 +97,6 @@ async def process_assets(request: ProcessAssetsRequest, background_tasks: Backgr
 
 import detect_duplicates
 
-# ... existing imports ...
-
 def run_duplicate_detection_job(write_to_snowflake: bool):
     logger.info("Starting duplicate detection job")
     try:
